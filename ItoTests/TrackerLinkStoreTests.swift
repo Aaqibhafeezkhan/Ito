@@ -11,6 +11,7 @@ struct TrackerLinkStoreTests {
         let manager = TrackerManager(
             dbPool: database.dbPool,
             credentialStore: FakeTrackerCredentialStore(),
+            malCredentialStore: FakeTrackerCredentialStore(),
             legacyTokenStore: FakeLegacyTokenStore(),
             usernameDefaults: UserDefaults(suiteName: UUID().uuidString)!
         )
@@ -40,6 +41,7 @@ struct TrackerLinkStoreTests {
         let manager = TrackerManager(
             dbPool: database.dbPool,
             credentialStore: FakeTrackerCredentialStore(),
+            malCredentialStore: FakeTrackerCredentialStore(),
             legacyTokenStore: FakeLegacyTokenStore(),
             usernameDefaults: UserDefaults(suiteName: UUID().uuidString)!
         )
@@ -78,6 +80,7 @@ struct TrackerLinkStoreTests {
         let manager = TrackerManager(
             dbPool: database.dbPool,
             credentialStore: FakeTrackerCredentialStore(),
+            malCredentialStore: FakeTrackerCredentialStore(),
             legacyTokenStore: FakeLegacyTokenStore(),
             usernameDefaults: UserDefaults(suiteName: UUID().uuidString)!
         )
@@ -103,5 +106,23 @@ struct TrackerLinkStoreTests {
             #expect(record?.remoteMediaId == "remote")
             #expect(try TrackerLinkRecord.fetchCount(db) == 1)
         }
+    }
+
+    @Test func linksToSignedOutTrackersDoNotCountAsTracked() async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let manager = TrackerManager(
+            dbPool: database.dbPool,
+            credentialStore: FakeTrackerCredentialStore(),
+            malCredentialStore: FakeTrackerCredentialStore(),
+            legacyTokenStore: FakeLegacyTokenStore(),
+            usernameDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        let media = MediaIdentity(pluginId: "plugin", canonicalMediaId: "media")
+
+        try await manager.link(media: media, providerId: "myanimelist", remoteMediaId: "anime:1")
+
+        #expect(manager.trackerId(for: media, providerId: "myanimelist") == "anime:1")
+        #expect(!manager.hasAuthenticatedLink(for: media))
     }
 }
