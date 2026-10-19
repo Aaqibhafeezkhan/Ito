@@ -15,6 +15,17 @@ open Ito/Ito.xcodeproj
 
 A paid Apple Developer Program membership is not required for simulator development or the unsigned CI builds.
 
+### Linting
+
+SwiftLint runs in the Xcode build, in a pre-commit hook, and in the `SwiftLint / lint` check on every pull request. CI treats warnings as errors. Install the hook once per clone:
+
+```bash
+brew install lefthook swiftlint
+lefthook install
+```
+
+The hook lints staged Swift files. To lint everything, run `swiftlint lint --strict`; `swiftlint --fix` corrects what it can.
+
 ## Branches
 
 Create short-lived branches from current `main`:
@@ -43,6 +54,8 @@ Use a Conventional Commit-style pull-request title, such as:
 ## Testing without signing
 
 CI builds and tests with code signing disabled. Locally, select an iOS Simulator and run the `Ito` scheme. Do not commit signing identities, `.p12` files, provisioning profiles, Apple account details, or personal development-team identifiers.
+
+To run on a device, set your team in Xcode and leave that change uncommitted. The pre-commit hook and the `CI / No development team` check reject a `DEVELOPMENT_TEAM` value in `project.pbxproj` or an `.xcconfig` file. If you stage the project file for another change, stage only the hunks you mean to commit (`git add -p`).
 
 ## Build channels
 

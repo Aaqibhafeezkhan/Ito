@@ -1,0 +1,9 @@
+# Git hooks. Install once per clone: `brew install lefthook swiftlint && lefthook install`.
+pre-commit:
+  commands:
+    swiftlint:
+      glob: "*.swift"
+      run: swiftlint lint --strict --quiet --force-exclude {staged_files}
+    development-team:
+      glob: "*.{pbxproj,xcconfig}"
+      run: .github/scripts/check_development_team.sh --staged {staged_files}

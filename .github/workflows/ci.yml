@@ -19,6 +19,18 @@ env:
   SCHEME: Ito
 
 jobs:
+  development-team:
+    name: No development team
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check project files for a development team ID
+        run: .github/scripts/check_development_team.sh
+
   build-and-test:
     name: Build and unit test
     runs-on: macos-26
@@ -92,7 +104,7 @@ jobs:
         id: simulator
         working-directory: Ito
         shell: bash
-        run: echo "id=$(python3 scripts/select_simulator.py)" >> "$GITHUB_OUTPUT"
+        run: echo "id=$(python3 .github/scripts/select_simulator.py)" >> "$GITHUB_OUTPUT"
 
       # Build once for the simulator that runs the tests. A generic simulator
       # destination also compiles x86_64, which no test ever executes. Coverage
