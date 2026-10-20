@@ -57,6 +57,24 @@ final class BackupSettingsViewModelTests: XCTestCase {
         XCTAssertFalse(subject.viewModel.isFileExporterPresented)
     }
 
+    func testBackupErrorsUseReadableMessagesInsteadOfTypeNames() async {
+        let subject = makeSubject()
+        subject.service.exportResponses = [.failure(BackupExportError.incompleteMigration)]
+
+        await subject.viewModel.beginExport()?.value
+
+        XCTAssertEqual(
+            subject.viewModel.alert,
+            .exportFailed("Ito is still preparing your library. Try again in a moment.")
+        )
+        XCTAssertEqual(
+            BackupSettingsViewModel.message(
+                for: BackupPreflightError.rejected(.missingPluginIdentity(pluginId: "secret-plugin"))
+            ),
+            "A series in the backup has no source."
+        )
+    }
+
     func testExporterFailurePresentsExistingAlert() async {
         let subject = makeSubject()
         await subject.viewModel.beginExport()?.value
@@ -87,6 +105,40 @@ final class BackupSettingsViewModelTests: XCTestCase {
         XCTAssertNil(subject.viewModel.beginExport())
         subject.viewModel.fileExporterDidComplete(.success(url("saved.itobackup")))
         XCTAssertNotNil(subject.viewModel.beginExport())
+    }
+
+    func testCancellingSaveSheetWithoutCompletionFreesScreenAndLogsCancelled() async {
+        let subject = makeSubject()
+        await subject.viewModel.beginExport()?.value
+
+        // iOS 15/16 only flips isPresented on cancel and never calls onCompletion.
+        subject.viewModel.setFileExporterPresented(false)
+
+        XCTAssertNil(subject.viewModel.exportFileURL)
+        XCTAssertFalse(subject.viewModel.isOperationRunning)
+        XCTAssertFalse(subject.viewModel.isExportDisabled)
+        XCTAssertFalse(subject.viewModel.isImportDisabled)
+        XCTAssertEqual(subject.logger.events.map(\.phase), [.started])
+
+        XCTAssertNotNil(subject.viewModel.beginExport())
+        XCTAssertEqual(subject.logger.events.map(\.phase), [.started, .finished, .started])
+        XCTAssertEqual(subject.logger.events[1].outcome, .cancelled)
+    }
+
+    func testCompletionAfterSheetDismissalStillReportsOutcome() async {
+        let subject = makeSubject()
+        await subject.viewModel.beginExport()?.value
+
+        subject.viewModel.setFileExporterPresented(false)
+        subject.viewModel.fileExporterDidComplete(
+            .failure(BackupSettingsTestError.expected("exporter rejected destination"))
+        )
+
+        XCTAssertEqual(subject.viewModel.alert, .exportFailed("exporter rejected destination"))
+        XCTAssertEqual(subject.logger.events.last?.outcome, .failed(.persistence))
+
+        subject.viewModel.screenDidDisappear()
+        XCTAssertEqual(subject.logger.events.map(\.phase), [.started, .finished])
     }
 
     func testImporterSuccessSelectsExactURLAndPresentsStrategy() {
@@ -419,6 +471,23 @@ final class BackupSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(subject.service.acknowledgmentCallCount, 1)
         XCTAssertNil(subject.viewModel.activeRestoreReport)
         XCTAssertFalse(subject.viewModel.showsRestoreReport)
+    }
+
+    func testAcknowledgedUnresolvedSourcesAreOfferedAfterReportSheetCloses() async throws {
+        let migration = migrationReport([migrationUnresolved(foreignId: "foreign", resolvedId: "local")])
+        let report = try backupSettingsTestReport(id: "unresolved", migrationReport: migration)
+        let subject = reportSubject(report)
+        subject.service.reportsAfterAcknowledgment = [nil]
+
+        await subject.viewModel.acknowledgeRestoreReport()?.value
+        XCTAssertNil(subject.viewModel.migrationReportToResolve)
+
+        subject.viewModel.restoreReportDidDismiss()
+        XCTAssertEqual(subject.viewModel.migrationReportToResolve, migration)
+
+        subject.viewModel.dismissMigrationReport()
+        subject.viewModel.restoreReportDidDismiss()
+        XCTAssertNil(subject.viewModel.migrationReportToResolve)
     }
 
     func testAcknowledgmentFailureKeepsUnacknowledgedReportVisible() async throws {

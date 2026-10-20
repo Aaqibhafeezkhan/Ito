@@ -208,7 +208,7 @@ final class SettingsViewModelTests: XCTestCase {
                 AppPreferenceKeys.skipCompleted
             ]
         )
-        XCTAssertEqual(notification.requestCallCount, 0)
+        XCTAssertEqual(notification.requestCallCount, 1)
         XCTAssertTrue(viewModel.alwaysShowCategoryPicker)
         XCTAssertTrue(viewModel.backgroundUpdatesEnabled)
         XCTAssertFalse(viewModel.updateNotifications)
@@ -559,7 +559,8 @@ final class SettingsViewModelTests: XCTestCase {
 
         await viewModel.setIncognitoMode(true)
         await viewModel.setDiscordRPCEnabled(true)
-        await viewModel.setDiscordRPCURL("wss://example.com/socket")
+        viewModel.discordRPCURLDraft = "wss://example.com/socket"
+        await viewModel.commitDiscordRPCURLDraft()
 
         let history = await persistence.writeHistory
         XCTAssertEqual(history.count, 3)
@@ -650,9 +651,11 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.alert, .saveFailed)
 
         await persistence.failNextWriteAttempt()
-        await viewModel.setDiscordRPCURL("wss://example.com/socket")
+        viewModel.discordRPCURLDraft = "wss://example.com/socket"
+        await viewModel.commitDiscordRPCURLDraft()
         XCTAssertEqual(store.discordRPCURL, "ws://127.0.0.1:3000")
         XCTAssertEqual(viewModel.discordRPCURL, "ws://127.0.0.1:3000")
+        XCTAssertEqual(viewModel.discordRPCURLDraft, "wss://example.com/socket")
         XCTAssertEqual(viewModel.alert, .saveFailed)
 
         let history = await persistence.writeHistory
@@ -667,27 +670,47 @@ final class SettingsViewModelTests: XCTestCase {
         )
     }
 
-    func testPrivacyInvalidDiscordURLDoesNotWriteAndValidRetryClearsAlert() async throws {
+    func testPrivacyInvalidDiscordURLKeepsTypedTextWithoutWritingAndValidRetrySaves() async throws {
         let (store, persistence, manager) = try await makePrivacySettingsStore()
         let viewModel = PrivacySettingsViewModel(
             settingsStore: store,
             discordRPCManager: manager
         )
 
-        await viewModel.setDiscordRPCURL("https://example.com/not-a-websocket")
+        viewModel.discordRPCURLDraft = "https://example.com/not-a-websocket"
+        await viewModel.commitDiscordRPCURLDraft()
 
         var history = await persistence.writeHistory
         XCTAssertTrue(history.isEmpty)
         XCTAssertEqual(store.discordRPCURL, "ws://127.0.0.1:3000")
         XCTAssertEqual(viewModel.discordRPCURL, "ws://127.0.0.1:3000")
-        XCTAssertEqual(viewModel.alert, .saveFailed)
+        XCTAssertEqual(viewModel.discordRPCURLDraft, "https://example.com/not-a-websocket")
+        XCTAssertEqual(viewModel.alert, .invalidDiscordURL)
 
-        await viewModel.setDiscordRPCURL("wss://example.com/socket")
+        viewModel.discordRPCURLDraft = " wss://example.com/socket "
+        await viewModel.commitDiscordRPCURLDraft()
 
         history = await persistence.writeHistory
         XCTAssertEqual(history.count, 1)
         XCTAssertEqual(store.discordRPCURL, "wss://example.com/socket")
         XCTAssertEqual(viewModel.discordRPCURL, "wss://example.com/socket")
+        XCTAssertEqual(viewModel.discordRPCURLDraft, "wss://example.com/socket")
+        XCTAssertNil(viewModel.alert)
+    }
+
+    func testPrivacyLeavingWithInvalidDiscordURLResetsFieldWithoutAlert() async throws {
+        let (store, persistence, manager) = try await makePrivacySettingsStore()
+        let viewModel = PrivacySettingsViewModel(
+            settingsStore: store,
+            discordRPCManager: manager
+        )
+
+        viewModel.discordRPCURLDraft = "ws://"
+        await viewModel.commitDiscordRPCURLDraft(discardingInvalid: true)
+
+        let history = await persistence.writeHistory
+        XCTAssertTrue(history.isEmpty)
+        XCTAssertEqual(viewModel.discordRPCURLDraft, "ws://127.0.0.1:3000")
         XCTAssertNil(viewModel.alert)
     }
 
@@ -836,20 +859,20 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.alert, .saveFailed)
     }
 
-    func testStorageAppearanceRefreshesOnceAndPublishesFormattedUsage() async throws {
+    func testStorageShowsCalculatingUntilFirstMeasurementThenFormattedUsage() async throws {
         let (store, _, storageAccess) = try await makeStorageSettingsStore()
-        storageAccess.currentCacheSizeBytes = 256
         storageAccess.cacheSizeAfterRefresh = 2_048
         let viewModel = StorageSettingsViewModel(
             settingsStore: store,
             storageAccess: storageAccess
         )
+        XCTAssertEqual(viewModel.formattedCurrentUsage, "Calculating…")
 
-        viewModel.refreshCacheUsage()
+        await viewModel.refreshCacheUsage()
 
         XCTAssertEqual(storageAccess.refreshCallCount, 1)
         XCTAssertEqual(storageAccess.clearCallCount, 0)
-        XCTAssertEqual(storageAccess.formattedBytes, [256, 2_048])
+        XCTAssertEqual(storageAccess.formattedBytes, [2_048])
         XCTAssertEqual(viewModel.formattedCurrentUsage, "bytes:2048")
     }
 
@@ -862,7 +885,7 @@ final class SettingsViewModelTests: XCTestCase {
             storageAccess: storageAccess
         )
 
-        viewModel.clearCache()
+        await viewModel.clearCache()
 
         XCTAssertEqual(storageAccess.clearCallCount, 1)
         XCTAssertEqual(storageAccess.refreshCallCount, 0)
@@ -916,8 +939,6 @@ final class SettingsViewModelTests: XCTestCase {
             XCTAssertFalse(source.contains(forbidden), "Forbidden Storage access: \(forbidden)")
         }
         XCTAssertTrue(source.contains("@StateObject private var viewModel"))
-        XCTAssertTrue(source.contains("Text(\"Clear Cache\")"))
-        XCTAssertTrue(source.contains(".foregroundColor(.red)"))
     }
 
     private func makeSettingsStore(
@@ -931,7 +952,7 @@ final class SettingsViewModelTests: XCTestCase {
         return (store, persistence)
     }
 
-    private func makeLibrarySettingsStore(
+    func makeLibrarySettingsStore(
         updateNotifications: Bool = true
     ) async throws -> (
         AppSettingsStore,

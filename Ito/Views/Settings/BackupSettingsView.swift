@@ -3,12 +3,17 @@ import UniformTypeIdentifiers
 
 struct BackupSettingsView: View {
     @StateObject private var viewModel: BackupSettingsViewModel
+    private let makeMigrationReportViewModel: (MigrationReport) -> MigrationReportViewModel
     #if DEBUG
     @ObservedObject private var uiTestFixtures = UITestLaunchFixtureCoordinator.shared
     #endif
 
-    init(viewModel: BackupSettingsViewModel) {
+    init(
+        viewModel: BackupSettingsViewModel,
+        makeMigrationReportViewModel: @escaping (MigrationReport) -> MigrationReportViewModel
+    ) {
         _viewModel = StateObject(wrappedValue: viewModel)
+        self.makeMigrationReportViewModel = makeMigrationReportViewModel
     }
 
     var body: some View {
@@ -37,13 +42,15 @@ struct BackupSettingsView: View {
 
             Section(
                 header: Text("Import"),
-                footer: Text("Restoring from a backup allows you to completely replace your current library, or merge missing items into it.")
+                footer: Text("Restore a backup by merging it into your current library, or by replacing your library with it.")
             ) {
                 Button(action: requestImport) {
                     HStack {
                         Label("Restore from Backup", systemImage: "square.and.arrow.down")
                         Spacer()
-                        if viewModel.managerSnapshot.isRestoring {
+                        if viewModel.managerSnapshot.isRestoring
+                            || viewModel.operationKind == .mergeAnalysis
+                            || viewModel.operationKind == .restore {
                             ProgressView()
                         }
                     }
@@ -90,7 +97,7 @@ struct BackupSettingsView: View {
                 viewModel.cancelRestoreStrategy()
             }
         } message: {
-            Text("Merging keeps your existing library items and only adds missing ones. Wiping completely deletes your current library and replaces it with the backup.")
+            Text("Merging adds missing items and lets you choose which version to keep when an item differs. Wiping deletes your current library and replaces it with the backup.")
         }
         .alert(
             "Wipe and Replace Library?",
@@ -126,21 +133,18 @@ struct BackupSettingsView: View {
                 .interactiveDismissDisabled()
             }
         }
+        // While the restore report sheet is up, its content shows alerts instead: a
+        // presenting view cannot present a second modal on iOS 15.
         .alert(item: Binding(
-            get: { viewModel.alert },
+            get: { viewModel.showsRestoreReport ? nil : viewModel.alert },
             set: { if $0 == nil { viewModel.dismissAlert() } }
-        )) { alert in
-            Alert(
-                title: Text(alert.title),
-                message: Text(alert.message),
-                dismissButton: .default(Text("OK"), action: viewModel.dismissAlert)
-            )
-        }
+        ), content: makeAlert)
         .sheet(
             isPresented: Binding(
                 get: { viewModel.showsRestoreReport },
                 set: { viewModel.setRestoreReportPresented($0) }
-            )
+            ),
+            onDismiss: viewModel.restoreReportDidDismiss
         ) {
             if let report = viewModel.activeRestoreReport {
                 BackupRestoreReportView(
@@ -148,6 +152,26 @@ struct BackupSettingsView: View {
                     onAcknowledge: { _ = viewModel.acknowledgeRestoreReport() }
                 )
                 .interactiveDismissDisabled()
+                .alert(item: Binding(
+                    get: { viewModel.showsRestoreReport ? viewModel.alert : nil },
+                    set: { if $0 == nil { viewModel.dismissAlert() } }
+                ), content: makeAlert)
+            }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { viewModel.migrationReportToResolve != nil },
+                set: { if !$0 { viewModel.dismissMigrationReport() } }
+            )
+        ) {
+            if let report = viewModel.migrationReportToResolve {
+                NavigationView {
+                    MigrationReportView(
+                        viewModel: makeMigrationReportViewModel(report),
+                        onDismiss: viewModel.dismissMigrationReport
+                    )
+                }
+                .navigationViewStyle(.stack)
             }
         }
         .alert(
@@ -173,6 +197,14 @@ struct BackupSettingsView: View {
             Task { await uiTestFixtures.refreshBackupFixtureState() }
         }
         #endif
+    }
+
+    private func makeAlert(_ alert: BackupSettingsAlert) -> Alert {
+        Alert(
+            title: Text(alert.title),
+            message: Text(alert.message),
+            dismissButton: .default(Text("OK"), action: viewModel.dismissAlert)
+        )
     }
 
     private func requestImport() {
@@ -203,7 +235,8 @@ struct BackupSettingsView_Previews: PreviewProvider {
                 viewModel: BackupSettingsViewModel(
                     dependencies: .unavailable(),
                     presentationLogger: OSLogPresentationEventLogger()
-                )
+                ),
+                makeMigrationReportViewModel: { MigrationReportViewModel(readOnlyReport: $0) }
             )
         }
     }

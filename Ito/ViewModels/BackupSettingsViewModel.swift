@@ -73,6 +73,8 @@ final class BackupSettingsViewModel: ObservableObject {
     @Published private(set) var exportDefaultFilename = "ItoBackup"
     @Published private(set) var isFileExporterPresented = false
     @Published private(set) var activeRestoreReport: BackupRestoreReport?
+    /// Unresolved sources from an acknowledged restore, offered for fixing after the report closes.
+    @Published private(set) var migrationReportToResolve: MigrationReport?
     @Published private(set) var showsRefreshPending = false
     @Published private(set) var alert: BackupSettingsAlert?
     @Published private(set) var operationKind: BackupSettingsOperationKind?
@@ -97,6 +99,12 @@ final class BackupSettingsViewModel: ObservableObject {
     private let claimCommittedRefreshRetry: @MainActor () -> Bool
     private let releaseCommittedRefreshRetry: @MainActor () -> Void
     private var activeOperation: Operation?
+    private var pendingMigrationReport: MigrationReport?
+    /// An export whose save sheet closed before `onCompletion` reported a result. On iOS 15/16 a
+    /// cancelled exporter never calls `onCompletion`, so the screen is released at dismissal and
+    /// the outcome is logged when a late completion arrives, or as cancelled once the next
+    /// operation starts or the screen goes away.
+    private var dismissedExportOperation: Operation?
     private var operationTask: Task<Void, Never>?
     private var presentationGeneration: UInt64 = 0
     private var isPresentationActive = true
@@ -242,7 +250,7 @@ final class BackupSettingsViewModel: ObservableObject {
             } catch {
                 self?.publishOperationFailure(
                     error,
-                    alert: .exportFailed(error.localizedDescription),
+                    alert: .exportFailed(Self.message(for: error)),
                     operation: operation
                 )
             }
@@ -252,21 +260,44 @@ final class BackupSettingsViewModel: ObservableObject {
     }
 
     func setFileExporterPresented(_ isPresented: Bool) {
-        guard isCurrentExportOperation else { return }
+        guard let operation = activeOperation, operation.kind == .export else { return }
         isFileExporterPresented = isPresented
+        guard !isPresented else { return }
+        exportFileURL = nil
+        dismissedExportOperation = operation
+        activeOperation = nil
+        operationKind = nil
+        operationTask = nil
     }
 
     func fileExporterDidComplete(_ result: Result<URL, Error>) {
-        guard let operation = activeOperation, operation.kind == .export else { return }
-        exportFileURL = nil
-        isFileExporterPresented = false
+        let operation: Operation
+        if let active = activeOperation, active.kind == .export {
+            operation = active
+            exportFileURL = nil
+            isFileExporterPresented = false
+            activeOperation = nil
+            operationKind = nil
+            operationTask = nil
+        } else if let dismissed = dismissedExportOperation {
+            operation = dismissed
+        } else {
+            return
+        }
+        dismissedExportOperation = nil
         switch result {
         case .success:
-            finishOperation(operation, outcome: .succeeded)
+            logFinishedOnce(operation, outcome: .succeeded)
         case .failure(let error):
-            alert = .exportFailed(error.localizedDescription)
-            finishOperation(operation, outcome: .failed(.persistence))
+            alert = .exportFailed(Self.message(for: error))
+            logFinishedOnce(operation, outcome: .failed(.persistence))
         }
+    }
+
+    private func finishDismissedExportAsCancelled() {
+        guard let operation = dismissedExportOperation else { return }
+        dismissedExportOperation = nil
+        logFinishedOnce(operation, outcome: .cancelled)
     }
 
     @discardableResult
@@ -300,7 +331,7 @@ final class BackupSettingsViewModel: ObservableObject {
             }
         case .failure(let error):
             importPresentation = .idle
-            alert = .importFailed(error.localizedDescription)
+            alert = .importFailed(Self.message(for: error))
         }
     }
 
@@ -380,7 +411,7 @@ final class BackupSettingsViewModel: ObservableObject {
             } catch {
                 self?.publishOperationFailure(
                     error,
-                    alert: .mergeCheckFailed(error.localizedDescription),
+                    alert: .mergeCheckFailed(Self.message(for: error)),
                     operation: operation
                 )
             }
@@ -459,19 +490,20 @@ final class BackupSettingsViewModel: ObservableObject {
 
     @discardableResult
     func acknowledgeRestoreReport() -> Task<Void, Never>? {
-        guard activeRestoreReport != nil,
+        guard let acknowledgedReport = activeRestoreReport,
               let operation = claimOperation(.reportAcknowledgment) else { return nil }
+        let migrationReport = acknowledgedReport.migrationReport
         let task = Task { @MainActor [weak self, service] in
             do {
                 _ = try await service.acknowledgeRestoreReport()
                 self?.publishAcknowledgmentSuccess(
-                    nextReport: service.backupSettingsSnapshot.lastRestoreReport,
+                    migrationReport: migrationReport,
                     operation: operation
                 )
             } catch {
                 self?.publishOperationFailure(
                     error,
-                    alert: .acknowledgmentFailed(error.localizedDescription),
+                    alert: .acknowledgmentFailed(Self.message(for: error)),
                     operation: operation
                 )
             }
@@ -482,6 +514,18 @@ final class BackupSettingsViewModel: ObservableObject {
 
     func setRestoreReportPresented(_ isPresented: Bool) {
         guard !isPresented, activeRestoreReport == nil else { return }
+    }
+
+    /// Called once the restore report sheet has finished dismissing, so the source fix-up
+    /// sheet is not presented while another presentation is still in flight.
+    func restoreReportDidDismiss() {
+        guard isPresentationActive, let report = pendingMigrationReport else { return }
+        pendingMigrationReport = nil
+        migrationReportToResolve = report
+    }
+
+    func dismissMigrationReport() {
+        migrationReportToResolve = nil
     }
 
     func dismissAlert() {
@@ -497,6 +541,7 @@ final class BackupSettingsViewModel: ObservableObject {
     func screenDidDisappear() {
         isPresentationActive = false
         presentationGeneration &+= 1
+        finishDismissedExportAsCancelled()
         guard let operation = activeOperation else { return }
         switch operation.kind {
         case .export:
@@ -522,10 +567,6 @@ final class BackupSettingsViewModel: ObservableObject {
             && !isFileExporterPresented
     }
 
-    private var isCurrentExportOperation: Bool {
-        activeOperation?.kind == .export
-    }
-
     private func claimOperation(
         _ kind: BackupSettingsOperationKind,
         admissionClaim: (@MainActor () -> Bool)? = nil
@@ -535,6 +576,7 @@ final class BackupSettingsViewModel: ObservableObject {
               !managerSnapshot.isExporting,
               !managerSnapshot.isRestoring,
               admissionClaim?() ?? true else { return nil }
+        finishDismissedExportAsCancelled()
         let operation = Operation(
             id: UUID(),
             kind: kind,
@@ -661,7 +703,7 @@ final class BackupSettingsViewModel: ObservableObject {
                 return
             }
             if canPublishTransient(operation) {
-                alert = .restoreFailed(error.localizedDescription)
+                alert = .restoreFailed(Self.message(for: error))
             }
             conflictPresentation = nil
             pendingImportURL = nil
@@ -696,13 +738,16 @@ final class BackupSettingsViewModel: ObservableObject {
     }
 
     private func publishAcknowledgmentSuccess(
-        nextReport: BackupRestoreReport?,
+        migrationReport: MigrationReport?,
         operation: Operation
     ) {
-        _ = nextReport
         guard activeOperation == operation else {
             finishStaleOperation(operation)
             return
+        }
+        if let migrationReport, !migrationReport.unresolvedPlugins.isEmpty,
+           canPublishTransient(operation) {
+            pendingMigrationReport = migrationReport
         }
         finishDurableOperation(operation, outcome: .succeeded)
     }
@@ -794,6 +839,22 @@ final class BackupSettingsViewModel: ObservableObject {
                 outcome: outcome
             )
         )
+    }
+
+    /// Readable alert text for the errors backup code throws; system text for anything else.
+    static func message(for error: Error) -> String {
+        switch error {
+        case BackupPreflightError.rejected(let reason):
+            return reason.userMessage
+        case BackupExportError.incompleteMigration:
+            return "Ito is still preparing your library. Try again in a moment."
+        case BackupMergeError.ambiguousLocalIdentity:
+            return "A series in the backup matches more than one series in your library, so nothing was merged."
+        case BackupMergeError.invalidReplacementCategoryReference:
+            return "A series in the backup belongs to a list that could not be found, so nothing was merged."
+        default:
+            return error.localizedDescription
+        }
     }
 
     private func presentationEventKind(

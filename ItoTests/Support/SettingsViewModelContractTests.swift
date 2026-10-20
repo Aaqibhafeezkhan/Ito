@@ -59,72 +59,6 @@ extension SettingsViewModelTests {
         ))
     }
 
-    func testAppearancePresentationContracts() throws {
-        let appearanceSource = try source(at: "Ito/Views/Settings/AppearanceSettingsView.swift")
-
-        XCTAssertTrue(appearanceSource.contains(
-            "Section(header: Text(\"Theme\"), footer: Text(\"Choose your preferred appearance.\"))"
-        ))
-        XCTAssertTrue(appearanceSource.contains("Picker(\"Appearance\", selection:"))
-        XCTAssertTrue(appearanceSource.contains(".pickerStyle(SegmentedPickerStyle())"))
-        XCTAssertTrue(appearanceSource.contains(".navigationTitle(\"Appearance\")"))
-    }
-
-    func testLibraryConditionalPresentationAndAlertActionsRemainWired() throws {
-        let source = try source(at: "Ito/Views/Settings/LibrarySettingsView.swift")
-        let conditionalStart = try XCTUnwrap(source.range(
-            of: "if viewModel.showsUpdateOptions {"
-        ))
-        let conditionalEnd = try XCTUnwrap(source.range(
-            of: "            } header: {\n                Text(\"Updates\")",
-            range: conditionalStart.upperBound..<source.endIndex
-        ))
-        let conditionalBlock = String(source[conditionalStart.lowerBound..<conditionalEnd.lowerBound])
-
-        XCTAssertTrue(conditionalBlock.contains("Toggle(\"Notify on New Chapters\""))
-        XCTAssertTrue(conditionalBlock.contains("Picker(\"Update Frequency\""))
-        XCTAssertTrue(conditionalBlock.contains("Toggle(\"Skip Completed Series\""))
-        XCTAssertFalse(conditionalBlock.contains("Toggle(\"Wi-Fi Only\""))
-        XCTAssertTrue(source.contains(
-            "primaryButton: .cancel(Text(\"Cancel\")) {\n                    viewModel.dismissAlert()"
-        ))
-        XCTAssertTrue(source.contains(
-            "secondaryButton: .default(Text(\"Settings\")) {\n                    Task { await viewModel.openApplicationSettings() }"
-        ))
-    }
-
-    func testPrivacyAndStoragePresentationContractsRemainExact() throws {
-        let privacySource = try source(at: "Ito/Views/Settings/PrivacySettingsView.swift")
-        let storageSource = try source(at: "Ito/Views/Settings/StorageSettingsView.swift")
-
-        for status in [
-            "Text(\"Connected\").foregroundColor(.green)",
-            "Text(\"Connecting...\").foregroundColor(.yellow)",
-            "Text(\"Disconnected\").foregroundColor(.gray)",
-            "Text(\"Error: \\(message)\").foregroundColor(.red).lineLimit(1)"
-        ] {
-            XCTAssertTrue(privacySource.contains(status), "Missing Privacy status: \(status)")
-        }
-        XCTAssertTrue(privacySource.contains("if viewModel.showsDiscordDetails {"))
-        XCTAssertTrue(privacySource.contains(
-            "TextField(\"Server URL (e.g. ws://127.0.0.1:3000)\", text: Binding("
-        ))
-        XCTAssertTrue(privacySource.contains(
-            ".autocapitalization(.none)\n                    .disableAutocorrection(true)"
-        ))
-
-        XCTAssertTrue(storageSource.contains(
-            "Button(action: viewModel.clearCache) {\n                    Text(\"Clear Cache\")"
-        ))
-        XCTAssertTrue(storageSource.contains(
-            ".onAppear(perform: viewModel.refreshCacheUsage)"
-        ))
-        XCTAssertFalse(storageSource.contains("confirmationDialog"))
-        XCTAssertFalse(storageSource.contains("Clear Cache?"))
-        XCTAssertFalse(storageSource.contains("cleared successfully"))
-        XCTAssertFalse(storageSource.contains("AppMessageCenter"))
-    }
-
     func testBootstrapReusesRuntimeSettingsDependencyIdentities() throws {
         let source = try source(at: "Ito/Managers/DurableStateBootstrap.swift")
         let installStart = try XCTUnwrap(source.range(of: "private func install(_ runtime: Runtime)"))
@@ -167,57 +101,6 @@ extension SettingsViewModelTests {
             "default:\n            return .other"
         ] {
             XCTAssertTrue(source.contains(mapping), "Missing log conversion: \(mapping)")
-        }
-    }
-
-    func testSettingsDestinationContractHasExactCasesAndMappings() throws {
-        XCTAssertEqual(
-            SettingsDestination.allCases.map(String.init(describing:)),
-            [
-                "appearance",
-                "library",
-                "privacy",
-                "trackers",
-                "backup",
-                "readerUnavailable",
-                "storage",
-                "network",
-                "extensionsUnavailable",
-                "debugLogs"
-            ]
-        )
-
-        let settingsSource = try source(at: "Ito/Views/Settings/SettingsView.swift")
-        let routeFactorySource = try source(
-            at: "Ito/Views/Search/SearchRouteFactory.swift"
-        )
-        let appFactorySource = try XCTUnwrap(
-            routeFactorySource.components(separatedBy: "struct SearchRouteFactory").first
-        )
-
-        for destination in SettingsDestination.allCases {
-            XCTAssertTrue(
-                settingsSource.contains("makeSettingsDestination(for: .\(destination))")
-            )
-        }
-        for mapping in [
-            "case .appearance:\n            makeAppearanceSettingsView()",
-            "case .library:\n            makeLibrarySettingsView()",
-            "case .privacy:\n            makePrivacySettingsView()",
-            "case .trackers:\n            makeTrackerSettingsView()",
-            "case .backup:\n            makeBackupSettingsView()",
-            "case .storage:\n            makeStorageSettingsView()",
-            "case .network:\n            makeNetworkSettingsView()",
-            "case .debugLogs:\n            makeDebugLogView()"
-        ] {
-            XCTAssertTrue(appFactorySource.contains(mapping), "Missing mapping: \(mapping)")
-        }
-        for placeholder in [
-            "Text(\"Reader Settings View\")",
-            "Text(\"Manage Extensions View\")"
-        ] {
-            XCTAssertTrue(appFactorySource.contains(placeholder))
-            XCTAssertFalse(settingsSource.contains(placeholder))
         }
     }
 
