@@ -406,44 +406,95 @@ final class TrackerDetailsViewModelTests: XCTestCase {
     private func automaticSyncNote(providerID: String, status: String) async -> String? {
         let service = TrackerDetailsServiceFake()
         service.queuedLoadResults = [.success(TrackerMediaEntry(status: status, progress: 3, score: nil, startDate: nil, finishDate: nil))]
+        let isMangaBaka = providerID == "mangabaka"
         let viewModel = makeViewModel(
-            media: trackerTestMedia(id: providerID == "myanimelist" ? "anime:1" : "remote-1", format: "TV"),
+            media: trackerTestMedia(
+                id: providerID == "myanimelist" ? "anime:1" : isMangaBaka ? "42" : "remote-1",
+                format: isMangaBaka ? "MANGA" : "TV"
+            ),
             service: service,
             isLinked: true,
             providerID: providerID,
-            providerName: providerID == "myanimelist" ? "MyAnimeList" : "AniList"
+            providerName: providerID == "myanimelist" ? "MyAnimeList" : isMangaBaka ? "MangaBaka" : "AniList"
         )
         await load(viewModel, state: .existing)
         return viewModel.automaticSyncNote
     }
 
-    func testMyAnimeListRefusesToLowerProgressUnlessRepeating() async {
+    func testLoadingAPlannedEntryWithProgressKeepsItPlanned() async {
         let service = TrackerDetailsServiceFake()
-        service.queuedLoadResults = [.success(TrackerMediaEntry(status: "CURRENT", progress: 10, score: nil, startDate: nil, finishDate: nil))]
+        service.queuedLoadResults = [.success(TrackerMediaEntry(status: "PLANNING", progress: 3, score: nil, startDate: nil, finishDate: nil))]
         let viewModel = makeViewModel(
-            media: trackerTestMedia(id: "anime:1", format: "TV"),
+            media: trackerTestMedia(id: "42", format: "MANGA"),
             service: service,
             isLinked: true,
-            providerID: "myanimelist",
-            providerName: "MyAnimeList"
+            providerID: "mangabaka",
+            providerName: "MangaBaka"
         )
         await load(viewModel, state: .existing)
-        viewModel.progress = "4"
 
-        viewModel.save()
+        XCTAssertEqual(viewModel.status, "PLANNING")
+        XCTAssertEqual(viewModel.progress, "3")
 
-        XCTAssertTrue(service.updateInvocations.isEmpty)
-        XCTAssertEqual(viewModel.failure, .progressWouldDecrease)
-        XCTAssertTrue(viewModel.isPresentingFailureAlert)
-        XCTAssertNil(viewModel.output)
-
-        viewModel.status = "REPEATING"
         viewModel.save()
         await trackingWaitUntil { !viewModel.isSaving }
         XCTAssertEqual(
             service.updateInvocations,
-            [.init(providerID: "myanimelist", mediaID: "anime:1", progress: 4, status: "REPEATING")]
+            [.init(providerID: "mangabaka", mediaID: "42", progress: 3, status: "PLANNING")]
         )
+    }
+
+    func testTrackerExplanationReplacesTheGenericLoadFailure() async {
+        let service = TrackerDetailsServiceFake()
+        service.queuedLoadResults = [.failure(MangaBakaTrackerError.seriesMerged(into: 1995))]
+        let viewModel = makeViewModel(
+            media: trackerTestMedia(id: "42", format: "MANGA"),
+            service: service,
+            isLinked: true,
+            providerID: "mangabaka",
+            providerName: "MangaBaka"
+        )
+        await load(viewModel, state: .failure)
+
+        XCTAssertEqual(
+            viewModel.remoteLoadErrorMessage,
+            "MangaBaka merged this series into series 1995. Stop tracking it and link it again."
+        )
+    }
+
+    func testForwardOnlyTrackersRefuseToLowerProgressUnlessRepeating() async {
+        let trackers = [
+            (id: "myanimelist", name: "MyAnimeList", mediaID: "anime:1", format: "TV"),
+            (id: "mangabaka", name: "MangaBaka", mediaID: "42", format: "MANHWA")
+        ]
+        for tracker in trackers {
+            let service = TrackerDetailsServiceFake()
+            service.queuedLoadResults = [.success(TrackerMediaEntry(status: "CURRENT", progress: 10, score: nil, startDate: nil, finishDate: nil))]
+            let viewModel = makeViewModel(
+                media: trackerTestMedia(id: tracker.mediaID, format: tracker.format),
+                service: service,
+                isLinked: true,
+                providerID: tracker.id,
+                providerName: tracker.name
+            )
+            await load(viewModel, state: .existing)
+            viewModel.progress = "4"
+
+            viewModel.save()
+
+            XCTAssertTrue(service.updateInvocations.isEmpty, tracker.id)
+            XCTAssertEqual(viewModel.failure, .progressWouldDecrease(providerName: tracker.name))
+            XCTAssertTrue(viewModel.isPresentingFailureAlert)
+            XCTAssertNil(viewModel.output)
+
+            viewModel.status = "REPEATING"
+            viewModel.save()
+            await trackingWaitUntil { !viewModel.isSaving }
+            XCTAssertEqual(
+                service.updateInvocations,
+                [.init(providerID: tracker.id, mediaID: tracker.mediaID, progress: 4, status: "REPEATING")]
+            )
+        }
     }
 
     func testAniListStillLetsProgressGoDown() async {
@@ -475,5 +526,10 @@ final class TrackerDetailsViewModelTests: XCTestCase {
         XCTAssertNil(watching)
         let anilist = await automaticSyncNote(providerID: "anilist", status: "COMPLETED")
         XCTAssertNil(anilist)
+        let mangaBaka = await automaticSyncNote(providerID: "mangabaka", status: "PAUSED")
+        XCTAssertEqual(
+            mangaBaka,
+            "Automatic progress updates are off while this entry is Paused. Set it to Reading to resume them."
+        )
     }
 }

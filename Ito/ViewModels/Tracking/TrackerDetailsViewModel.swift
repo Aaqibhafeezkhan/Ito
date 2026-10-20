@@ -17,7 +17,7 @@ enum TrackerDetailsFailure: Equatable {
     case remoteUpdate
     case linkPersistenceAfterRemoteUpdate
     case unlinkPersistence
-    case progressWouldDecrease
+    case progressWouldDecrease(providerName: String)
 
     var message: String {
         switch self {
@@ -27,8 +27,8 @@ enum TrackerDetailsFailure: Equatable {
             return "The tracker entry was updated remotely, but the local link was not saved. Please retry to finish linking."
         case .unlinkPersistence:
             return "Tracking could not be stopped locally. Please try again."
-        case .progressWouldDecrease:
-            return "MyAnimeList progress only moves forward from Ito. Choose Repeating to start over, or change it on MyAnimeList."
+        case .progressWouldDecrease(let providerName):
+            return "\(providerName) progress only moves forward from Ito. Choose Repeating to start over, or change it on \(providerName)."
         }
     }
 }
@@ -110,6 +110,8 @@ final class TrackerDetailsViewModel: ObservableObject {
     private var hasStarted = false
     /// The progress of the entry as last loaded from the remote; `nil` when there is none.
     private var loadedProgress: Int?
+    /// The tracker's own explanation of the last load failure, when it has one.
+    private var remoteLoadFailureMessage: String?
 
     init(
         destination: TrackerDetailsDestination,
@@ -137,9 +139,9 @@ final class TrackerDetailsViewModel: ObservableObject {
     var isLoadingEntry: Bool { remoteEntryState == .loading }
 
     var remoteLoadErrorMessage: String? {
-        remoteEntryState == .failure
-            ? "Existing tracker progress could not be checked. Please retry before saving."
-            : nil
+        guard remoteEntryState == .failure else { return nil }
+        return remoteLoadFailureMessage
+            ?? "Existing tracker progress could not be checked. Please retry before saving."
     }
 
     var currentStatusLabel: String {
@@ -185,9 +187,10 @@ final class TrackerDetailsViewModel: ObservableObject {
         Self.statusLabel(for: statusOption, isReadingFormat: media.isReadingFormat)
     }
 
-    /// Explains when Ito's automatic MyAnimeList updates are off for the loaded entry. `nil` when they are on.
+    /// Explains when Ito's automatic updates are off for the loaded entry on trackers that only
+    /// move entries the user is reading or watching. `nil` when they are on.
     var automaticSyncNote: String? {
-        guard providerID == MALCredentialRepository.providerID, let loadedStatus else { return nil }
+        guard TrackerWriteRules.movesProgressForwardOnly(providerID), let loadedStatus else { return nil }
         switch loadedStatus {
         case "COMPLETED", "PAUSED", "DROPPED":
             return "Automatic progress updates are off while this entry is \(displayLabel(for: loadedStatus)). Set it to \(currentStatusLabel) to resume them."
@@ -275,11 +278,11 @@ final class TrackerDetailsViewModel: ObservableObject {
         guard saveOperationID == nil,
               unlinkOperationID == nil,
               remoteEntryState == .existing || remoteEntryState == .new else { return }
-        if providerID == MALCredentialRepository.providerID,
+        if TrackerWriteRules.movesProgressForwardOnly(providerID),
            remoteEntryState == .existing,
            status != "REPEATING",
            let loadedProgress, let newProgress = Int(progress), newProgress < loadedProgress {
-            failure = .progressWouldDecrease
+            failure = .progressWouldDecrease(providerName: providerName)
             isPresentingFailureAlert = true
             return
         }
@@ -500,6 +503,7 @@ final class TrackerDetailsViewModel: ObservableObject {
         cancelOperation(id: loadOperationID, task: loadTask, kind: .remoteLoad)
         let operationID = UUID()
         loadOperationID = operationID
+        remoteLoadFailureMessage = nil
         remoteEntryState = .loading
         presentationLogger.log(
             .started(
@@ -540,6 +544,7 @@ final class TrackerDetailsViewModel: ObservableObject {
                     logIgnoredStale(kind: .remoteLoad, operationID: operationID)
                     return
                 }
+                remoteLoadFailureMessage = (error as? any TrackerUserFacingError)?.userMessage
                 remoteEntryState = .failure
                 finishLoad(operationID, outcome: .failed(.network))
             }
@@ -547,10 +552,12 @@ final class TrackerDetailsViewModel: ObservableObject {
     }
 
     private func apply(_ entry: TrackerMediaEntry) {
-        status = entry.status ?? "PLANNING"
+        // Progress first: setting it while the status is still Planning would promote the loaded
+        // entry to Reading or Watching through `progress`'s didSet.
         if let entryProgress = entry.progress {
             progress = String(entryProgress)
         }
+        status = entry.status ?? "PLANNING"
         score = entry.score.flatMap { $0 > 0 ? $0 : nil }
         startDate = entry.startDate
         finishDate = entry.finishDate

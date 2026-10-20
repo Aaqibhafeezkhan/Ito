@@ -38,6 +38,11 @@ struct TrackerSettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear(perform: viewModel.refreshAuthoritativeState)
         .onDisappear(perform: viewModel.cancelOwnedWork)
+        .sheet(item: $viewModel.signInSheetProvider) { provider in
+            TrackerTokenSignInSheet(provider: provider) { token in
+                viewModel.signIn(providerID: provider.identifier, token: token)
+            }
+        }
     }
 
     @ViewBuilder
@@ -102,6 +107,13 @@ struct TrackerSettingsView: View {
                 }
             }
             .disabled(viewModel.isAuthenticationOperationActive)
+
+            if provider.tokenCreationURL != nil {
+                Button("Use a Personal Access Token") {
+                    viewModel.presentTokenSignIn(providerID: provider.identifier)
+                }
+                .disabled(viewModel.isAuthenticationOperationActive)
+            }
         }
     }
 }
