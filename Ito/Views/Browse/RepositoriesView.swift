@@ -75,7 +75,7 @@ struct RepositoriesView: View {
                     .padding(.horizontal, 20)
                     .padding(.vertical, 10)
                     .background(Color.accentColor)
-                    .foregroundColor(.white)
+                    .foregroundColor(.itoOnAccent)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
             }
             .padding(.top, 4)
@@ -314,7 +314,7 @@ struct PackageRowView: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         } else {
             Image(systemName: "puzzlepiece.extension.fill")
-                .foregroundStyle(.blue)
+                .foregroundStyle(Color.accentColor)
                 .imageScale(.large)
                 .frame(width: 40, height: 40)
         }
@@ -336,7 +336,7 @@ struct PackageRowView: View {
 
             case .updateAvailable:
                 Button("Update", action: onAction)
-                    .buttonStyle(.borderedProminent)
+                    .itoProminentButtonStyle()
                     .controlSize(.small)
 
             case .installed:
@@ -350,7 +350,7 @@ struct PackageRowView: View {
 
             case .notInstalled:
                 Button("Install", action: onAction)
-                    .buttonStyle(.borderedProminent)
+                    .itoProminentButtonStyle()
                     .controlSize(.small)
             }
         }

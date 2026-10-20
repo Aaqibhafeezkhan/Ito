@@ -104,7 +104,7 @@ private struct BrowseContentView: View {
                     .padding(.horizontal, 20)
                     .padding(.vertical, 10)
                     .background(Color.accentColor)
-                    .foregroundColor(.white)
+                    .foregroundColor(.itoOnAccent)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
             }
             .padding(.top, 4)
@@ -133,7 +133,7 @@ private struct BrowseContentView: View {
                             .padding(.horizontal, 7)
                             .padding(.vertical, 2)
                             .background(Color.accentColor)
-                            .foregroundColor(.white)
+                            .foregroundColor(.itoOnAccent)
                             .clipShape(Capsule())
                     }
                 }
@@ -237,7 +237,7 @@ private struct UpdateRowView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             } else {
                 Image(systemName: "puzzlepiece.extension.fill")
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(Color.accentColor)
                     .imageScale(.large)
                     .frame(width: 40, height: 40)
             }
@@ -258,7 +258,7 @@ private struct UpdateRowView: View {
                     .frame(width: 70)
             } else {
                 Button("Update", action: onUpdate)
-                    .buttonStyle(.borderedProminent)
+                    .itoProminentButtonStyle()
                     .controlSize(.small)
             }
         }
@@ -281,7 +281,7 @@ struct PluginRowView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
             } else {
                 Image(systemName: "puzzlepiece.extension.fill")
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(Color.accentColor)
                     .imageScale(.large)
                     .frame(width: 40, height: 40)
             }
