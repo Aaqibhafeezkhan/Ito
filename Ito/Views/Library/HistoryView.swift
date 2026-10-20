@@ -4,8 +4,8 @@ import NukeUI
 struct HistoryView: View {
     @StateObject private var viewModel: HistoryViewModel
 
-    init(viewModel: HistoryViewModel) {
-        _viewModel = StateObject(wrappedValue: viewModel)
+    init(viewModel: @autoclosure @escaping () -> HistoryViewModel) {
+        _viewModel = StateObject(wrappedValue: viewModel())
     }
 
     var body: some View {
@@ -30,16 +30,22 @@ struct HistoryView: View {
                 .padding(.bottom, 60)
             case .content:
                 List {
-                    ForEach(viewModel.history) { entry in
-                        HistoryItemRow(entry: entry)
-                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                Button(role: .destructive) {
-                                    Task { await viewModel.deleteEntry(id: entry.id) }
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
+                    Section {
+                        ForEach(viewModel.history) { entry in
+                            HistoryItemRow(entry: entry, sourceName: viewModel.sourceName(for: entry))
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    Button(role: .destructive) {
+                                        Task { await viewModel.deleteEntry(id: entry.id) }
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                    .disabled(viewModel.deletingEntryIDs.contains(entry.id))
                                 }
-                                .disabled(viewModel.deletingEntryIDs.contains(entry.id))
-                            }
+                        }
+                    } footer: {
+                        if viewModel.isShowingFetchLimit {
+                            Text("Showing the \(HistoryEntry.fetchLimit) most recent entries.")
+                        }
                     }
                 }
                 .listStyle(.plain)
@@ -51,13 +57,27 @@ struct HistoryView: View {
             ToolbarItem(placement: .navigationBarTrailing) {
                 if viewModel.isClearVisible {
                     Button(role: .destructive) {
-                        Task { await viewModel.clearHistory() }
+                        viewModel.requestClear()
                     } label: {
                         Text("Clear")
                     }
                     .disabled(viewModel.isClearing)
                 }
             }
+        }
+        .confirmationDialog(
+            "Clear All History?",
+            isPresented: clearConfirmationBinding,
+            titleVisibility: .visible
+        ) {
+            Button("Clear History", role: .destructive) {
+                Task { await viewModel.confirmClear() }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.cancelClear()
+            }
+        } message: {
+            Text("This removes all reading and watch history.")
         }
         .alert(
             viewModel.failure?.alertTitle ?? "History Change Failed",
@@ -71,6 +91,13 @@ struct HistoryView: View {
         }
     }
 
+    private var clearConfirmationBinding: Binding<Bool> {
+        Binding(
+            get: { viewModel.isClearConfirmationPresented },
+            set: { if !$0 { viewModel.cancelClear() } }
+        )
+    }
+
     private var failureBinding: Binding<Bool> {
         Binding(
             get: { viewModel.failure != nil },
@@ -81,6 +108,7 @@ struct HistoryView: View {
 
 struct HistoryItemRow: View {
     let entry: HistoryEntry
+    let sourceName: String
 
     var body: some View {
         HStack(spacing: 12) {
@@ -98,11 +126,13 @@ struct HistoryItemRow: View {
                 .frame(width: 50, height: 75)
                 .cornerRadius(6)
                 .clipped()
+                .accessibilityHidden(true)
             } else {
                 Color.itoCardBackground
                     .frame(width: 50, height: 75)
                     .cornerRadius(6)
                     .overlay(Image(systemName: "photo.on.rectangle.angled").foregroundStyle(.tertiary))
+                    .accessibilityHidden(true)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -121,7 +151,7 @@ struct HistoryItemRow: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
 
-                Text(entry.record.pluginId.capitalized)
+                Text(sourceName)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -129,11 +159,16 @@ struct HistoryItemRow: View {
             Spacer()
         }
         .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
     }
 
-    private func timeAgo(from date: Date) -> String {
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .full
-        return formatter.localizedString(for: date, relativeTo: Date())
+        return formatter
+    }()
+
+    private func timeAgo(from date: Date) -> String {
+        Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
     }
 }

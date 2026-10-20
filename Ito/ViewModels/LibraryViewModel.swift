@@ -43,12 +43,17 @@ final class LibraryViewModel: ObservableObject {
         case content
     }
 
-    @Published private(set) var snapshot: LibraryRootSnapshot
+    @Published private(set) var snapshot: LibraryRootSnapshot {
+        didSet { categoryMembers = Self.members(of: snapshot) }
+    }
+    /// Series IDs per list ID, rebuilt with each snapshot.
+    private var categoryMembers: [String: Set<String>]
     @Published var searchText = ""
     @Published private(set) var layoutStyle: LibraryLayoutStyle
     @Published private(set) var selectedCategoryID: String?
     @Published private(set) var isEditing = false
     @Published private(set) var categoryAssignmentItemID: String?
+    @Published private(set) var pendingRemoval: LibraryItem?
     @Published private(set) var removingItemIDs: Set<String> = []
     @Published private(set) var updateSnapshot: LibraryUpdateSnapshot
     @Published private(set) var installedPluginIDs: Set<String>
@@ -57,6 +62,7 @@ final class LibraryViewModel: ObservableObject {
     @Published private(set) var alert: LibraryAlert?
 
     private let dependencies: PreparedLibraryDependencies
+    private let tabRouter: any LibraryTabRouting
     private let messagePresenter: any LibraryMessagePresenting
     private let presentationLogger: any PresentationEventLogging
 
@@ -79,13 +85,16 @@ final class LibraryViewModel: ObservableObject {
 
     init(
         dependencies: PreparedLibraryDependencies,
+        tabRouter: any LibraryTabRouting,
         messagePresenter: any LibraryMessagePresenting,
         presentationLogger: any PresentationEventLogging
     ) {
         self.dependencies = dependencies
+        self.tabRouter = tabRouter
         self.messagePresenter = messagePresenter
         self.presentationLogger = presentationLogger
         snapshot = dependencies.library.rootSnapshot
+        categoryMembers = Self.members(of: dependencies.library.rootSnapshot)
         let initialLayout = Self.layoutStyle(from: dependencies.layout.storedLibraryLayoutStyle)
         authoritativeLayoutStyle = initialLayout
         layoutStyle = initialLayout
@@ -141,21 +150,17 @@ final class LibraryViewModel: ObservableObject {
     }
 
     var groups: [LibraryPresentationGroup] {
-        snapshot.categories.compactMap { category in
-            let memberIDs = Set(
-                snapshot.links.lazy
-                    .filter { $0.categoryId == category.id }
-                    .map(\.itemId)
-            )
-            let items = filteredItems.filter { memberIDs.contains($0.id) }
-
+        let items = filteredItems
+        return snapshot.categories.compactMap { category in
             if layoutStyle == .tabbed,
                let selectedCategoryID,
                selectedCategoryID != category.id {
                 return nil
             }
+            let memberIDs = categoryMembers[category.id] ?? []
+            let categoryItems = items.filter { memberIDs.contains($0.id) }
             if layoutStyle == .sectioned,
-               items.isEmpty,
+               categoryItems.isEmpty,
                snapshot.categories.count > 1 {
                 return nil
             }
@@ -163,13 +168,25 @@ final class LibraryViewModel: ObservableObject {
                 id: category.id,
                 name: category.name,
                 isSystem: category.isSystemCategory,
-                items: items
+                items: categoryItems
             )
         }
     }
 
+    private static func members(of snapshot: LibraryRootSnapshot) -> [String: Set<String>] {
+        snapshot.links.reduce(into: [:]) { members, link in
+            members[link.categoryId, default: []].insert(link.itemId)
+        }
+    }
+
+    /// Whether a search matches nothing on screen. "All" in the tabbed layout lists every series,
+    /// while the other views list the series of each list.
     var showsNoResults: Bool {
-        !searchText.isEmpty && groups.allSatisfy(\.items.isEmpty)
+        guard !searchText.isEmpty else { return false }
+        if layoutStyle == .tabbed && selectedCategoryID == nil {
+            return filteredItems.isEmpty
+        }
+        return groups.allSatisfy(\.items.isEmpty)
     }
 
     var updateProgressCurrent: Int { updateSnapshot.current }
@@ -211,6 +228,10 @@ final class LibraryViewModel: ObservableObject {
         categoryAssignmentItemID = nil
     }
 
+    func browseDiscover() {
+        tabRouter.showDiscover()
+    }
+
     func toggleLayout() {
         let requested: LibraryLayoutStyle = layoutStyle == .sectioned ? .tabbed : .sectioned
         intendedLayoutStyle = requested
@@ -242,11 +263,28 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    func remove(_ item: LibraryItem) {
-        guard removalOperationIDs[item.id] == nil else { return }
-        guard snapshot.items.contains(where: {
-            $0.id == item.id && $0.pluginId == item.pluginId
-        }) else { return }
+    /// Asks the user to confirm removing a series.
+    func requestRemoval(_ item: LibraryItem) {
+        guard removalOperationIDs[item.id] == nil, contains(item) else { return }
+        pendingRemoval = item
+    }
+
+    func cancelRemoval() {
+        pendingRemoval = nil
+    }
+
+    func confirmRemoval() {
+        guard let item = pendingRemoval else { return }
+        pendingRemoval = nil
+        remove(item)
+    }
+
+    private func contains(_ item: LibraryItem) -> Bool {
+        snapshot.items.contains { $0.id == item.id && $0.pluginId == item.pluginId }
+    }
+
+    private func remove(_ item: LibraryItem) {
+        guard removalOperationIDs[item.id] == nil, contains(item) else { return }
 
         let operationID = UUID()
         removalOperationIDs[item.id] = operationID
@@ -312,9 +350,9 @@ final class LibraryViewModel: ObservableObject {
         let task = Task { @MainActor [weak self, updates] in
             do {
                 try await updates.checkLibraryForUpdates()
-                self?.publishUpdateCompletion(operationID: operationID, succeeded: true)
+                self?.publishUpdateCompletion(operationID: operationID, failure: nil)
             } catch {
-                self?.publishUpdateCompletion(operationID: operationID, succeeded: false)
+                self?.publishUpdateCompletion(operationID: operationID, failure: error)
             }
         }
         updateTask = task
@@ -408,6 +446,9 @@ final class LibraryViewModel: ObservableObject {
             !newSnapshot.items.contains(where: { $0.id == itemID })
         }) == true {
             categoryAssignmentItemID = nil
+        }
+        if let pendingRemoval, !contains(pendingRemoval) {
+            self.pendingRemoval = nil
         }
         if oldCategoryName != selectedCategoryName || selectedCategoryID == nil {
             presentDiscordIfNeeded()
@@ -516,7 +557,7 @@ final class LibraryViewModel: ObservableObject {
         )
     }
 
-    private func publishUpdateCompletion(operationID: UUID, succeeded: Bool) {
+    private func publishUpdateCompletion(operationID: UUID, failure: Error?) {
         guard updateOperationID == operationID else {
             logFinished(
                 kind: .remoteUpdate,
@@ -527,20 +568,21 @@ final class LibraryViewModel: ObservableObject {
         }
         updateOperationID = nil
         updateTask = nil
-        if succeeded {
-            logFinished(
-                kind: .remoteUpdate,
-                operationID: operationID,
-                outcome: .succeeded
-            )
-        } else {
+        let outcome: PresentationEventOutcome
+        switch failure {
+        case nil:
+            outcome = .succeeded
+        case UpdateRunError.alreadyRunning?:
+            // The running check already shows its progress banner.
+            outcome = .cancelled
+        case UpdateRunError.noSources?:
+            messagePresenter.present(.noUpdateSources)
+            outcome = .failed(.pluginUnavailable)
+        default:
             messagePresenter.present(.updateFailed)
-            logFinished(
-                kind: .remoteUpdate,
-                operationID: operationID,
-                outcome: .failed(.unknown)
-            )
+            outcome = .failed(.unknown)
         }
+        logFinished(kind: .remoteUpdate, operationID: operationID, outcome: outcome)
     }
 
     private func publishExportCompletion(

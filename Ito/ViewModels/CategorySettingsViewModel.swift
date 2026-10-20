@@ -96,7 +96,7 @@ final class CategorySettingsViewModel: ObservableObject {
               isAddCategoryPresented,
               let sessionID = addSessionID,
               Self.isValid(name: newCategoryName) else { return }
-        let name = newCategoryName
+        let name = newCategoryName.trimmingCharacters(in: .whitespacesAndNewlines)
         let operationID = UUID()
         createOperationID = operationID
         isCreating = true
@@ -130,7 +130,7 @@ final class CategorySettingsViewModel: ObservableObject {
     }
 
     func beginRename(categoryID: String) {
-        guard !isRenaming,
+        guard !(isRenaming && editingCategoryID == categoryID),
               let category = categories.first(where: { $0.id == categoryID }),
               !category.isSystemCategory else { return }
         renameSessionID = UUID()
@@ -145,7 +145,7 @@ final class CategorySettingsViewModel: ObservableObject {
               let categoryID = editingCategoryID,
               let sessionID = renameSessionID,
               Self.isValid(name: editedCategoryName) else { return }
-        let name = editedCategoryName
+        let name = editedCategoryName.trimmingCharacters(in: .whitespacesAndNewlines)
         let operationID = UUID()
         renameOperationID = operationID
         isRenaming = true
@@ -203,7 +203,6 @@ final class CategorySettingsViewModel: ObservableObject {
     }
 
     func cancelDelete() {
-        guard !isDeleting else { return }
         categoryPendingDeletionID = nil
     }
 
@@ -213,6 +212,7 @@ final class CategorySettingsViewModel: ObservableObject {
               categories.contains(where: { $0.id == categoryID && !$0.isSystemCategory }) else {
             return
         }
+        categoryPendingDeletionID = nil
         let operationID = UUID()
         deleteOperationID = operationID
         isDeleting = true
@@ -227,10 +227,6 @@ final class CategorySettingsViewModel: ObservableObject {
         do {
             try await organization.deleteCategory(id: categoryID)
             logFinished(.categoryDelete, operationID: operationID, outcome: .succeeded)
-            if deleteOperationID == operationID,
-               categoryPendingDeletionID == categoryID {
-                categoryPendingDeletionID = nil
-            }
         } catch is CancellationError {
             logFinished(.categoryDelete, operationID: operationID, outcome: .cancelled)
         } catch {

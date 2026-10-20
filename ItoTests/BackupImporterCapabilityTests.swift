@@ -29,6 +29,8 @@ struct BackupImporterCapabilityTests {
         )
 
         try await database.dbPool.write { db in
+            // The backup holds only the rows seeded here, not the migrated system list.
+            try db.execute(sql: "DELETE FROM libraryCategory")
             try BackupMetadataRecord(formatVersion: 1, createdAt: date).insert(db)
             for component in BackupComponent.allCases {
                 try BackupCapabilityRecord(
@@ -269,6 +271,10 @@ struct BackupImporterCapabilityTests {
     ) async throws {
         let source = try TestDatabase()
         defer { source.cleanup() }
+        // An old backup with empty library tables, without the migrated system list.
+        try await source.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM libraryCategory")
+        }
         let backup = try await ItoNativeImporter().parse(url: source.databaseURL)
 
         #expect(backup.representation(of: .libraryCore) == .representedEmpty)
@@ -305,6 +311,8 @@ struct BackupImporterCapabilityTests {
             readAt: date
         )
         try await destination.dbPool.write { db in
+            // The fixture's system list replaces the migrated one.
+            try db.execute(sql: "DELETE FROM libraryCategory WHERE isSystemCategory = 1")
             try localCategory.insert(db)
             try localItem.insert(db)
             try ItemCategoryLink(
@@ -330,7 +338,8 @@ struct BackupImporterCapabilityTests {
             )
         }
         let expectedCount = mode == .merge ? 1 : 0
-        #expect(counts.0 == expectedCount)
+        // Merge keeps the local system list; a wipe leaves a fresh one.
+        #expect(counts.0 == 1)
         #expect(counts.1 == expectedCount)
         #expect(counts.2 == expectedCount)
         #expect(counts.3 == expectedCount)
@@ -361,6 +370,7 @@ struct BackupImporterCapabilityTests {
             readAt: first.readAt
         )
         try await source.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM libraryCategory")
             try BackupMetadataRecord(formatVersion: 1, createdAt: date).insert(db)
             try BackupCapabilityRecord(
                 component: .readingHistory,
@@ -518,6 +528,7 @@ struct BackupImporterCapabilityTests {
         let partial = try TestDatabase()
         defer { partial.cleanup() }
         try await partial.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM libraryCategory")
             try BackupMetadataRecord(formatVersion: 1, createdAt: date).insert(db)
             try BackupCapabilityRecord(
                 component: .scalarAppPreferences,
@@ -543,6 +554,7 @@ struct BackupImporterCapabilityTests {
         let empty = try TestDatabase()
         defer { empty.cleanup() }
         try await empty.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM libraryCategory")
             try BackupMetadataRecord(formatVersion: 1, createdAt: date).insert(db)
             try BackupCapabilityRecord(
                 component: .scalarAppPreferences,

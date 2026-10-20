@@ -15,6 +15,7 @@ final class LibraryPublicationOrderTests: XCTestCase {
             isSystem: true
         )
         try await database.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM libraryCategory WHERE isSystemCategory = 1")
             try uncategorized.insert(db)
         }
         let scheduler = ManualLibraryObservationScheduler()
@@ -53,6 +54,7 @@ final class LibraryPublicationOrderTests: XCTestCase {
             isSystem: true
         )
         try await database.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM libraryCategory WHERE isSystemCategory = 1")
             try uncategorized.insert(db)
         }
         let scheduler = ManualLibraryObservationScheduler()
@@ -97,6 +99,7 @@ final class LibraryPublicationOrderTests: XCTestCase {
             isSystem: true
         )
         try await database.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM libraryCategory WHERE isSystemCategory = 1")
             try uncategorized.insert(db)
         }
         let scheduler = ManualLibraryObservationScheduler()
@@ -179,6 +182,7 @@ final class LibraryPublicationOrderTests: XCTestCase {
         )
         let item = makeItem(id: "organized")
         try await database.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM libraryCategory WHERE isSystemCategory = 1")
             try uncategorized.insert(db)
             try item.insert(db)
             try ItemCategoryLink(
@@ -271,6 +275,22 @@ final class LibraryPublicationOrderTests: XCTestCase {
         let externalPublication = await scheduler.nextPublication()
         externalPublication.run()
         XCTAssertEqual(manager.items.map(\.id), [external.id])
+    }
+
+    func testSeriesAreOrderedByTitleIgnoringCaseAndComparingNumbers() async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let items = ["Zeta", "the Knight", "Volume 10", "Volume 2"].map { makeItem(id: $0) }
+        try await database.dbPool.write { db in
+            for item in items {
+                try item.insert(db)
+            }
+        }
+
+        let manager = LibraryManager(dbPool: database.dbPool)
+        try await manager.reload()
+
+        XCTAssertEqual(manager.items.map(\.title), ["the Knight", "Volume 2", "Volume 10", "Zeta"])
     }
 
     private func makeItem(

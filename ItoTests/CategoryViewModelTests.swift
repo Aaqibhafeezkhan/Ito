@@ -44,7 +44,7 @@ final class CategoryViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.newCategoryName, "")
     }
 
-    func testSettingsCreateAwaitsPublicationThenDismissesAndPreservesExactName() async {
+    func testSettingsCreateAwaitsPublicationThenDismissesAndTrimsName() async {
         let (viewModel, service, _, logger) = makeSettings()
         service.createResponses = [.immediate(.success("new"))]
         viewModel.presentAddCategory()
@@ -52,7 +52,7 @@ final class CategoryViewModelTests: XCTestCase {
 
         await viewModel.createCategory()
 
-        XCTAssertEqual(service.createdNames, ["  New List  "])
+        XCTAssertEqual(service.createdNames, ["New List"])
         XCTAssertEqual(viewModel.categories.last?.id, "new")
         XCTAssertFalse(viewModel.isAddCategoryPresented)
         XCTAssertEqual(viewModel.newCategoryName, "")
@@ -102,7 +102,7 @@ final class CategoryViewModelTests: XCTestCase {
         XCTAssertTrue(viewModel.isAddCategoryPresented)
     }
 
-    func testSettingsRenameInitializesExactIdentityAndAwaitsDurableSuccess() async {
+    func testSettingsRenameInitializesExactIdentityAndSavesTrimmedName() async {
         let (viewModel, service, _, _) = makeSettings()
 
         viewModel.beginRename(categoryID: "alpha")
@@ -113,8 +113,8 @@ final class CategoryViewModelTests: XCTestCase {
         await viewModel.saveRename()
 
         XCTAssertEqual(service.renameRequests.first?.id, "alpha")
-        XCTAssertEqual(service.renameRequests.first?.name, " Renamed ")
-        XCTAssertEqual(viewModel.categories.first { $0.id == "alpha" }?.name, " Renamed ")
+        XCTAssertEqual(service.renameRequests.first?.name, "Renamed")
+        XCTAssertEqual(viewModel.categories.first { $0.id == "alpha" }?.name, "Renamed")
         XCTAssertEqual(viewModel.renameDismissalID, "alpha")
         viewModel.consumeRenameDismissal(categoryID: "alpha")
         XCTAssertNil(viewModel.editingCategoryID)
@@ -144,6 +144,29 @@ final class CategoryViewModelTests: XCTestCase {
 
         await viewModel.saveRename()
         XCTAssertEqual(viewModel.renameDismissalID, "alpha")
+    }
+
+    func testSettingsBeginRenameForAnotherCategoryWorksWhileRenameIsSaving() async {
+        let (viewModel, service, _, _) = makeSettings()
+        service.renameResponses = [.suspended]
+        viewModel.beginRename(categoryID: "alpha")
+        viewModel.editedCategoryName = "Alpha Edited"
+
+        let first = Task { await viewModel.saveRename() }
+        await waitUntil { service.pendingRenameCount == 1 }
+        viewModel.endRename(categoryID: "alpha")
+        viewModel.beginRename(categoryID: "beta")
+
+        XCTAssertEqual(viewModel.editingCategoryID, "beta")
+        XCTAssertEqual(viewModel.editedCategoryName, "Beta")
+
+        service.resolveRename(at: 0, result: .success(()))
+        await first.value
+
+        XCTAssertEqual(viewModel.editingCategoryID, "beta")
+        XCTAssertEqual(viewModel.editedCategoryName, "Beta")
+        XCTAssertNil(viewModel.renameDismissalID)
+        XCTAssertTrue(viewModel.canSaveRename)
     }
 
     func testSettingsNormalizesRenameAndDeleteWhenCategoryDisappears() {
@@ -179,15 +202,19 @@ final class CategoryViewModelTests: XCTestCase {
         XCTAssertTrue(service.deleteRequests.isEmpty)
     }
 
-    func testSettingsDeleteSuccessClearsConfirmationOnlyAfterPublication() async {
+    func testSettingsDeleteConfirmationClearsOnConfirmAndCategoryRemainsUntilPublication() async {
         let (viewModel, service, _, _) = makeSettings()
         service.deleteResponses = [.suspended]
         viewModel.requestDelete(categoryID: "alpha")
         viewModel.confirmDelete()
 
         await waitUntil { service.pendingDeleteCount == 1 }
-        XCTAssertEqual(viewModel.categoryPendingDeletionID, "alpha")
+        XCTAssertNil(viewModel.categoryPendingDeletionID)
+        XCTAssertTrue(viewModel.isDeleting)
         XCTAssertTrue(viewModel.categories.contains { $0.id == "alpha" })
+
+        viewModel.cancelDelete()
+        XCTAssertTrue(viewModel.isDeleting)
 
         service.resolveDelete(at: 0, result: .success(()))
         await waitUntil { !viewModel.isDeleting }
@@ -197,7 +224,7 @@ final class CategoryViewModelTests: XCTestCase {
         XCTAssertEqual(service.deleteRequests, ["alpha"])
     }
 
-    func testSettingsDeleteFailureKeepsTruthfulConfirmationAndSuppressesDuplicate() async {
+    func testSettingsDeleteFailureLeavesNoPendingDeletionAndCanBeRequestedAgain() async {
         let (viewModel, service, messages, _) = makeSettings()
         service.deleteResponses = [.suspended]
         viewModel.requestDelete(categoryID: "alpha")
@@ -212,10 +239,14 @@ final class CategoryViewModelTests: XCTestCase {
         )
         await waitUntil { !viewModel.isDeleting }
 
-        XCTAssertEqual(viewModel.categoryPendingDeletionID, "alpha")
+        XCTAssertNil(viewModel.categoryPendingDeletionID)
         XCTAssertTrue(viewModel.categories.contains { $0.id == "alpha" })
         XCTAssertEqual(viewModel.failure, .categoryDeleteFailed)
         XCTAssertEqual(messages.messages, [.categoryDeleteFailed])
+
+        viewModel.requestDelete(categoryID: "alpha")
+        XCTAssertEqual(viewModel.categoryPendingDeletionID, "alpha")
+        XCTAssertNil(viewModel.failure)
     }
 
     func testSettingsReorderPinsSystemAndPublishesRequestedRelativeOrder() async {
@@ -380,7 +411,7 @@ final class CategoryViewModelTests: XCTestCase {
 
         await viewModel.createAndAssignCategory()
 
-        XCTAssertEqual(service.createAndAssignRequests.first?.name, " New ")
+        XCTAssertEqual(service.createAndAssignRequests.first?.name, "New")
         XCTAssertEqual(service.createAndAssignRequests.first?.itemID, "item")
         XCTAssertTrue(viewModel.userCategories.contains { $0.id == "new" })
         XCTAssertEqual(viewModel.activeCategoryIDs, ["new"])

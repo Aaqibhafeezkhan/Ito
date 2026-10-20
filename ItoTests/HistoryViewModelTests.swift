@@ -122,6 +122,34 @@ final class HistoryViewModelTests: XCTestCase {
         XCTAssertFalse(harness.viewModel.isClearVisible)
     }
 
+    func testClearRequiresConfirmationBeforeWriting() async {
+        let harness = makeViewModel(history: [pr11bHistoryEntry(id: "one", readAt: 1)])
+
+        harness.viewModel.requestClear()
+        XCTAssertTrue(harness.viewModel.isClearConfirmationPresented)
+        XCTAssertEqual(harness.service.clearRequestCount, 0)
+
+        harness.viewModel.cancelClear()
+        XCTAssertFalse(harness.viewModel.isClearConfirmationPresented)
+        XCTAssertEqual(harness.service.clearRequestCount, 0)
+        XCTAssertEqual(harness.viewModel.phase, .content)
+
+        harness.viewModel.requestClear()
+        await harness.viewModel.confirmClear()
+
+        XCTAssertFalse(harness.viewModel.isClearConfirmationPresented)
+        XCTAssertEqual(harness.service.clearRequestCount, 1)
+        XCTAssertEqual(harness.viewModel.phase, .empty)
+    }
+
+    func testRequestClearIsIgnoredWithoutHistory() {
+        let harness = makeViewModel()
+
+        harness.viewModel.requestClear()
+
+        XCTAssertFalse(harness.viewModel.isClearConfirmationPresented)
+    }
+
     func testClearFailureRetainsHistoryIsRetryableAndSuppressesDuplicate() async {
         let entry = pr11bHistoryEntry(id: "one", readAt: 1)
         let harness = makeViewModel(history: [entry])
@@ -176,7 +204,19 @@ final class HistoryViewModelTests: XCTestCase {
         XCTAssertEqual(harness.service.clearRequestCount, 0)
     }
 
-    private func makeViewModel(history: [HistoryEntry] = []) -> (
+    func testSourceNameIsThePluginNameOrItsIDWhenUninstalled() {
+        let entry = pr11bHistoryEntry(id: "one", readAt: 1)
+        let installed = makeViewModel(sourceNames: ["plugin": "Atsumaru"]).viewModel
+        XCTAssertEqual(installed.sourceName(for: entry), "Atsumaru")
+
+        let uninstalled = makeViewModel().viewModel
+        XCTAssertEqual(uninstalled.sourceName(for: entry), "plugin")
+    }
+
+    private func makeViewModel(
+        history: [HistoryEntry] = [],
+        sourceNames: [String: String] = [:]
+    ) -> (
         viewModel: HistoryViewModel,
         service: HistoryServiceFake,
         messages: CategoryHistoryMessageSpy,
@@ -188,6 +228,7 @@ final class HistoryViewModelTests: XCTestCase {
         return (
             HistoryViewModel(
                 historyService: service,
+                sourceNames: HistorySourceNamesFake(names: sourceNames),
                 messagePresenter: messages,
                 presentationLogger: logger
             ),

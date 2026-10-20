@@ -3,8 +3,8 @@ import SwiftUI
 struct CategorySettingsView: View {
     @StateObject private var viewModel: CategorySettingsViewModel
 
-    init(viewModel: CategorySettingsViewModel) {
-        _viewModel = StateObject(wrappedValue: viewModel)
+    init(viewModel: @autoclosure @escaping () -> CategorySettingsViewModel) {
+        _viewModel = StateObject(wrappedValue: viewModel())
     }
 
     var body: some View {
@@ -38,7 +38,7 @@ struct CategorySettingsView: View {
                 Text("Your Lists")
             }
         }
-        .navigationTitle("Manage Categories")
+        .navigationTitle("Manage Lists")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -66,7 +66,7 @@ struct CategorySettingsView: View {
                 viewModel.cancelDelete()
             }
         } message: {
-            Text("Items in this list will be safely moved to Uncategorized.")
+            Text(deleteMessage)
         }
         .sheet(isPresented: addCategoryBinding) {
             addCategorySheet
@@ -81,6 +81,12 @@ struct CategorySettingsView: View {
         } message: {
             Text(viewModel.failure?.alertMessage ?? "Please try again.")
         }
+    }
+
+    private var deleteMessage: String {
+        let fallbackName = viewModel.systemCategory?.name ?? "Uncategorized"
+        return "Items only in this list move to \(fallbackName). "
+            + "Nothing is removed from your library."
     }
 
     private var deleteConfirmationBinding: Binding<Bool> {
@@ -118,7 +124,7 @@ struct CategorySettingsView: View {
                     TextField("List Name", text: $viewModel.newCategoryName)
                         .font(.body)
                 } footer: {
-                    Text("Enter a name for your new category.")
+                    Text("Enter a name for your new list.")
                 }
             }
             .navigationTitle("New List")
@@ -176,7 +182,7 @@ struct EditCategoryView: View {
                 TextField("List Name", text: $viewModel.editedCategoryName)
                     .font(.body)
             } footer: {
-                Text("Rename your category. Tap outside to dismiss.")
+                Text("Tap Done to save. Going back discards your changes.")
             }
         }
         .navigationTitle("Edit List")

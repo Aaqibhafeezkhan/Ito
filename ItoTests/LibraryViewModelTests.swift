@@ -115,6 +115,21 @@ final class LibraryViewModelTests: XCTestCase {
         XCTAssertTrue(subject.viewModel.groups[0].items.isEmpty)
     }
 
+    func testSearchInAllFindsSeriesThatAreInNoList() {
+        let listless = item("listless", "The Infinite Mage")
+        let subject = makeSubject(
+            snapshot: snapshot(items: [listless]),
+            layoutRawValue: LibraryLayoutStyle.tabbed.rawValue
+        )
+
+        subject.viewModel.searchText = "Mage"
+
+        XCTAssertEqual(subject.viewModel.filteredItems.map(\.id), ["listless"])
+        XCTAssertFalse(subject.viewModel.showsNoResults)
+        subject.viewModel.searchText = "Knight"
+        XCTAssertTrue(subject.viewModel.showsNoResults)
+    }
+
     func testLayoutInitialFallbackPersistenceFailureAndRapidStaleWrites() async {
         let initialTabbed = makeSubject(layoutRawValue: LibraryLayoutStyle.tabbed.rawValue)
         XCTAssertEqual(initialTabbed.viewModel.layoutStyle, .tabbed)
@@ -187,13 +202,32 @@ final class LibraryViewModelTests: XCTestCase {
         XCTAssertEqual(subject.viewModel.filteredItems.map(\.id), ["one", "two"])
     }
 
+    func testRemovalNeedsConfirmationAndCancelRemovesNothing() {
+        let first = item("one", "One", pluginID: "plugin.one")
+        let subject = makeSubject(snapshot: snapshot(items: [first]))
+
+        subject.viewModel.requestRemoval(first)
+        XCTAssertEqual(subject.viewModel.pendingRemoval?.id, "one")
+        subject.viewModel.cancelRemoval()
+        XCTAssertNil(subject.viewModel.pendingRemoval)
+        subject.viewModel.confirmRemoval()
+        XCTAssertTrue(subject.library.removeRequests.isEmpty)
+
+        subject.viewModel.requestRemoval(first)
+        subject.library.publish(snapshot(items: []))
+        XCTAssertNil(subject.viewModel.pendingRemoval)
+    }
+
     func testDurableRemoveSuppressesDuplicateAndFollowsAuthoritativePublication() async {
         let first = item("one", "One", pluginID: "plugin.one")
         let second = item("two", "Two", pluginID: "plugin.two")
         let subject = makeSubject(snapshot: snapshot(items: [first, second]))
 
-        subject.viewModel.remove(first)
-        subject.viewModel.remove(first)
+        subject.viewModel.requestRemoval(first)
+        subject.viewModel.confirmRemoval()
+        subject.viewModel.requestRemoval(first)
+        subject.viewModel.confirmRemoval()
+        XCTAssertNil(subject.viewModel.pendingRemoval)
         await waitUntil { subject.library.removeRequests.count == 1 }
         XCTAssertEqual(subject.library.removeRequests[0], .init(itemID: "one", pluginID: "plugin.one"))
         XCTAssertEqual(subject.viewModel.filteredItems.map(\.id), ["one", "two"])
@@ -203,7 +237,8 @@ final class LibraryViewModelTests: XCTestCase {
         subject.library.publish(snapshot(items: [second]))
         XCTAssertEqual(subject.viewModel.filteredItems.map(\.id), ["two"])
 
-        subject.viewModel.remove(second)
+        subject.viewModel.requestRemoval(second)
+        subject.viewModel.confirmRemoval()
         await waitUntil { subject.library.removeRequests.count == 2 }
         subject.library.resolveRemove(at: 0, result: .failure(TestFailure.expected))
         await waitUntil { subject.messages.messages == [.itemRemovalFailed] }
@@ -256,6 +291,19 @@ final class LibraryViewModelTests: XCTestCase {
         await waitUntil { subject.updates.checkCallCount == 3 }
         subject.updates.resolveCheck(at: 0, result: .success(()))
         await final.value
+
+        let noSources = Task { await subject.viewModel.requestUpdate() }
+        await waitUntil { subject.updates.checkCallCount == 4 }
+        subject.updates.resolveCheck(at: 0, result: .failure(UpdateRunError.noSources))
+        await noSources.value
+        XCTAssertEqual(subject.messages.messages, [.updateFailed, .noUpdateSources])
+
+        // A check already running shows its own progress, so joining it says nothing.
+        let alreadyRunning = Task { await subject.viewModel.requestUpdate() }
+        await waitUntil { subject.updates.checkCallCount == 5 }
+        subject.updates.resolveCheck(at: 0, result: .failure(UpdateRunError.alreadyRunning))
+        await alreadyRunning.value
+        XCTAssertEqual(subject.messages.messages, [.updateFailed, .noUpdateSources])
     }
 
     func testExportSuccessFailureDuplicateCallbacksAndStaleCancellationAreSanitized() async {
@@ -358,6 +406,8 @@ final class LibraryViewModelTests: XCTestCase {
             createdAt: Date(timeIntervalSince1970: 0)
         )
         try await database.dbPool.write { db in
+            // The fixture's system list replaces the migrated one.
+            try db.execute(sql: "DELETE FROM libraryCategory WHERE isSystemCategory = 1")
             try uncategorized.insert(db)
         }
         try await manager.reload()
@@ -403,6 +453,7 @@ final class LibraryViewModelTests: XCTestCase {
         return LibrarySubject(
             viewModel: LibraryViewModel(
                 dependencies: dependencies,
+                tabRouter: AppRouter(),
                 messagePresenter: messages,
                 presentationLogger: logger
             ),

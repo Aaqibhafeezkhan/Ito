@@ -139,6 +139,25 @@ struct LibraryView: View {
         .sheet(item: categoryAssignmentBinding) { intent in
             viewFactory.makeCategoryAssignmentSheet(itemID: intent.id)
         }
+        .confirmationDialog(
+            "Remove from Library?",
+            isPresented: removalConfirmationBinding,
+            titleVisibility: .visible,
+            presenting: viewModel.pendingRemoval
+        ) { _ in
+            Button("Remove", role: .destructive) { viewModel.confirmRemoval() }
+        } message: { item in
+            Text("\(item.title) is also removed from your lists. Reading history and progress are kept.")
+        }
+    }
+
+    private var removalConfirmationBinding: Binding<Bool> {
+        Binding(
+            get: { viewModel.pendingRemoval != nil },
+            set: { isPresented in
+                if !isPresented { viewModel.cancelRemoval() }
+            }
+        )
     }
 
     private var categoryAssignmentBinding: Binding<LibraryCategoryAssignmentIntent?> {
@@ -171,7 +190,7 @@ struct LibraryView: View {
                     onAssignCategories: {
                         viewModel.presentCategoryAssignment(for: item.id)
                     },
-                    onRemove: { viewModel.remove(item) }
+                    onRemove: { viewModel.requestRemoval(item) }
                 )
             }
         }
@@ -180,7 +199,7 @@ struct LibraryView: View {
     @ViewBuilder
     private var pillBar: some View {
         if dynamicTypeSize >= .accessibility1 {
-            Picker("Category", selection: categorySelectionBinding) {
+            Picker("List", selection: categorySelectionBinding) {
                 Text("All").tag(String?.none)
                 ForEach(viewModel.categories) { category in
                     Text(category.name).tag(String?.some(category.id))
@@ -231,6 +250,7 @@ struct LibraryView: View {
             HStack(spacing: 16) {
                 NavigationLink(destination: viewFactory.makeHistoryView()) {
                     Image(systemName: "clock.arrow.circlepath")
+                        .accessibilityLabel("History")
                 }
                 if viewModel.hasItems {
                     Button {
@@ -242,7 +262,7 @@ struct LibraryView: View {
                 }
                 NavigationLink(destination: viewFactory.makeCategorySettingsView()) {
                     Image(systemName: "folder.badge.gearshape")
-                        .accessibilityLabel("Manage Categories")
+                        .accessibilityLabel("Manage Lists")
                 }
             }
         }
@@ -340,9 +360,7 @@ struct LibraryView: View {
             Text("No items in \(categoryName).")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            Button("Browse Discover") {
-                // Future routing to Discover tab.
-            }
+            Button("Browse Discover", action: viewModel.browseDiscover)
             .font(.subheadline.weight(.semibold))
         }
         .frame(maxWidth: .infinity)
@@ -407,6 +425,7 @@ struct LibraryItemView: View {
     let onRemove: () -> Void
 
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var wiggleAngle = Double.random(in: -1.2...1.2)
     @State private var isWiggling = false
 
@@ -432,17 +451,17 @@ struct LibraryItemView: View {
                 }
             }
             if isEditing {
-                Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                        onRemove()
-                    }
-                } label: {
+                Button(action: onRemove) {
                     Image(systemName: "minus.circle.fill")
                         .font(.system(size: 22))
                         .foregroundStyle(.white, .red)
                         .background(Color.white.clipShape(Circle()).padding(3))
+                        // A 44 pt target around the 22 pt symbol.
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
-                .offset(x: -6, y: -6)
+                .accessibilityLabel("Remove \(item.title)")
+                .offset(x: -17, y: -17)
                 .transition(.scale.combined(with: .opacity))
                 .zIndex(1)
             }
@@ -454,8 +473,13 @@ struct LibraryItemView: View {
                 : .easeInOut(duration: 0.15),
             value: isWiggling
         )
+        // Cards that appear while editing wiggle too; Reduce Motion turns the wiggle off.
+        .onAppear { isWiggling = isEditing && !reduceMotion }
         .onChange(of: isEditing) { editing in
-            withAnimation { isWiggling = editing }
+            withAnimation { isWiggling = editing && !reduceMotion }
+        }
+        .onChange(of: reduceMotion) { reduce in
+            isWiggling = isEditing && !reduce
         }
     }
 
