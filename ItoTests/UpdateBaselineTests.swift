@@ -6,7 +6,7 @@ import ito_runner
 
 @MainActor
 struct UpdateBaselineTests {
-    @Test func existingBaselineAdvancesAndRepeatedCountClearsBadge() async throws {
+    @Test func newChaptersAddUpUntilTheSeriesIsOpened() async throws {
         let (database, manager, item) = try await makeSubject(knownCount: 10)
         defer { database.cleanup() }
         let checkedAt = Date(timeIntervalSince1970: 1_700_000_100)
@@ -25,10 +25,20 @@ struct UpdateBaselineTests {
         #expect(firstPersisted.lastCheckedAt == checkedAt)
         #expect(firstPersisted.lastUpdatedAt == checkedAt)
 
-        let secondDelta = await successfulUpdate(manager, item: item, freshCount: 12)
-        #expect(secondDelta == 0)
+        // A later check with nothing new keeps the unread badge.
+        #expect(await successfulUpdate(manager, item: item, freshCount: 12) == 0)
+        #expect(manager.badgeCount(for: identity(for: item)) == 2)
+
+        // More new chapters add to it.
+        #expect(await successfulUpdate(manager, item: item, freshCount: 13) == 1)
+        #expect(manager.badgeCount(for: identity(for: item)) == 3)
+
+        // Opening the series clears it.
+        try await manager.advanceBaseline(for: item.id, media: identity(for: item), knownChapterCount: 13)
         #expect(manager.badgeCount(for: identity(for: item)) == 0)
-        #expect(try await persistedItem(database, id: item.id).knownChapterCount == 12)
+        let reloaded = UpdateManager(dbPool: database.dbPool)
+        try await reloaded.reload()
+        #expect(reloaded.badgeCount(for: identity(for: item)) == 0)
     }
 
     @Test func latestPersistedBaselineWinsOverStaleInput() async throws {
@@ -73,9 +83,10 @@ struct UpdateBaselineTests {
         #expect(try await persistedItem(database, id: item.id).knownChapterCount == 11)
     }
 
-    @Test func failedFetchDoesNotMutatePersistedUpdateStateOrBadge() async throws {
+    @Test func failedFetchRecordsOnlyTheAttemptTime() async throws {
         let checkedAt = Date(timeIntervalSince1970: 1_700_000_001)
         let updatedAt = Date(timeIntervalSince1970: 1_700_000_002)
+        let attemptedAt = Date(timeIntervalSince1970: 1_700_003_600)
         let (database, manager, item) = try await makeSubject(
             knownCount: 10,
             status: "ongoing",
@@ -84,7 +95,7 @@ struct UpdateBaselineTests {
         )
         defer { database.cleanup() }
 
-        let delta = await manager.processUpdate(for: item) {
+        let delta = await manager.processUpdate(for: item, checkedAt: attemptedAt) {
             throw StubError.fetchFailed
         }
 
@@ -93,7 +104,7 @@ struct UpdateBaselineTests {
         let persisted = try await persistedItem(database, id: item.id)
         #expect(persisted.knownChapterCount == 10)
         #expect(persisted.status == "ongoing")
-        #expect(persisted.lastCheckedAt == checkedAt)
+        #expect(persisted.lastCheckedAt == attemptedAt)
         #expect(persisted.lastUpdatedAt == updatedAt)
     }
 
@@ -123,24 +134,27 @@ struct UpdateBaselineTests {
         #expect(badgeRowCount == 0)
     }
 
-    @Test func reloadPublishesPersistedScopedBadges() async throws {
+    @Test func reloadPublishesBadgesOfLibrarySeriesOnly() async throws {
         let database = try TestDatabase()
         defer { database.cleanup() }
         try await database.dbPool.write { db in
-            try UpdateBadgeRecord(
-                pluginId: "one",
-                canonicalMediaId: "same",
-                count: 3,
-                updatedAt: nil,
-                provenance: .runtime
-            ).insert(db)
-            try UpdateBadgeRecord(
-                pluginId: "two",
-                canonicalMediaId: "same",
-                count: 5,
-                updatedAt: nil,
-                provenance: .runtime
-            ).insert(db)
+            // The legacy "plugin_id" form maps to the same series identity as "id".
+            for (plugin, id) in [("one", "same"), ("two", "two_same")] {
+                try LibraryItem(
+                    id: id, title: id, coverUrl: nil, pluginId: plugin, isAnime: false, pluginType: .manga,
+                    rawPayload: Data(), anilistId: nil, status: nil, lastCheckedAt: nil, lastUpdatedAt: nil,
+                    knownChapterCount: 1
+                ).insert(db)
+            }
+            for (plugin, mediaID, count) in [("one", "same", 3), ("two", "same", 5), ("one", "removed", 7)] {
+                try UpdateBadgeRecord(
+                    pluginId: plugin,
+                    canonicalMediaId: mediaID,
+                    count: count,
+                    updatedAt: nil,
+                    provenance: .runtime
+                ).insert(db)
+            }
         }
         let manager = UpdateManager(dbPool: database.dbPool)
 
@@ -152,7 +166,22 @@ struct UpdateBaselineTests {
         #expect(manager.badgeCount(
             for: MediaIdentity(pluginId: "two", canonicalMediaId: "same")
         ) == 5)
+        // A badge left by a series no longer in the library is not counted.
         #expect(manager.totalBadgeCount == 8)
+    }
+
+    @Test func removingASeriesRemovesItsBadge() async throws {
+        let (database, manager, item) = try await makeSubject(knownCount: 10)
+        defer { database.cleanup() }
+        let library = LibraryManager(dbPool: database.dbPool)
+        library.configure(updateManager: manager)
+        #expect(await successfulUpdate(manager, item: item, freshCount: 12) == 2)
+
+        try await library.removeItemDurably(id: item.id, pluginId: item.pluginId)
+
+        #expect(manager.totalBadgeCount == 0)
+        let badgeRows = try await database.dbPool.read { db in try UpdateBadgeRecord.fetchCount(db) }
+        #expect(badgeRows == 0)
     }
 
     @Test func clearCommitsBeforePublishing() async throws {
@@ -195,7 +224,7 @@ struct UpdateBaselineTests {
         try await database.dbPool.read { db in
             let records = try UpdateBadgeRecord.fetchAll(db)
             #expect(records.count == 1)
-            #expect(records.single?.count == 2)
+            #expect(records.single?.count == 4)
         }
     }
 
@@ -223,6 +252,19 @@ struct UpdateBaselineTests {
             #expect(records.count == 1)
             #expect(records.single?.count == 2)
         }
+    }
+
+    @Test func scanlationsOfOneChapterCountOnceAndUnnumberedChaptersCountByKey() {
+        let chapters = [
+            Manga.Chapter(key: "a", chapter: 1, scanlator: "Team A"),
+            Manga.Chapter(key: "b", chapter: 1, scanlator: "Team B"),
+            Manga.Chapter(key: "c", chapter: 1.5),
+            Manga.Chapter(key: "extra-1"),
+            Manga.Chapter(key: "extra-2"),
+            Manga.Chapter(key: "extra-2")
+        ]
+
+        #expect(chapters.distinctChapterCount == 4)
     }
 
     private func makeSubject(

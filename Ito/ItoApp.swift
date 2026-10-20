@@ -9,7 +9,9 @@ struct ItoApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: "moe.itoapp.ito.refresh", using: nil) { task in
+        // The handler is MainActor-isolated in this target, so iOS must call it on the main queue;
+        // with no queue it runs on a background one and fails the runtime isolation check.
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: "moe.itoapp.ito.refresh", using: .main) { task in
             guard let refreshTask = task as? BGAppRefreshTask else { return }
             Self.handleAppRefresh(task: refreshTask)
         }
@@ -20,8 +22,15 @@ struct ItoApp: App {
             BootstrapGateView(bootstrap: bootstrap)
         }
         .onChange(of: scenePhase) { phase in
-            guard phase == .background else { return }
-            Task { await Self.scheduleAppRefresh(bootstrap: bootstrap) }
+            switch phase {
+            case .background:
+                Task { await Self.scheduleAppRefresh(bootstrap: bootstrap) }
+            case .active:
+                // Notifications may have been allowed in iOS Settings since the last check.
+                Task { await bootstrap.notificationManager?.checkStatus() }
+            default:
+                break
+            }
         }
     }
 
@@ -42,28 +51,48 @@ struct ItoApp: App {
     }
 
     private static func handleAppRefresh(task: BGAppRefreshTask) {
+        let completion = BackgroundTaskCompletion(task: task)
         let taskWrapper = Task { @MainActor in
             let bootstrap = DurableStateBootstrap.shared
             guard await bootstrap.prepare() else {
-                task.setTaskCompleted(success: false)
+                completion.finish(success: false)
                 return
             }
 
             await scheduleAppRefresh(bootstrap: bootstrap)
             guard let updateManager = bootstrap.updateManager else {
-                task.setTaskCompleted(success: false)
+                completion.finish(success: false)
                 return
             }
             let updatedItems = await updateManager.checkForUpdatesInBackground()
             if !updatedItems.isEmpty, let notificationManager = bootstrap.notificationManager {
                 await notificationManager.dispatchUpdateSummary(updatedItems: updatedItems)
             }
-            task.setTaskCompleted(success: true)
+            completion.finish(success: true)
         }
 
-        task.expirationHandler = {
+        // iOS expects the task to finish right away once it expires; a check still in a plugin
+        // call cannot be waited for. Work saved so far stays saved. `@Sendable` keeps this handler
+        // off the main actor, since iOS may call it on any queue.
+        task.expirationHandler = { @Sendable in
             taskWrapper.cancel()
+            completion.finish(success: false)
         }
+    }
+}
+
+/// Reports a background task's end to iOS exactly once, whichever path ends it first.
+private nonisolated final class BackgroundTaskCompletion: @unchecked Sendable {
+    private let task: BGTask
+    private let once = OnceFlag()
+
+    init(task: BGTask) {
+        self.task = task
+    }
+
+    func finish(success: Bool) {
+        guard once.claim() else { return }
+        task.setTaskCompleted(success: success)
     }
 }
 

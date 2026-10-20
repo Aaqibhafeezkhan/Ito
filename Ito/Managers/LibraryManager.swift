@@ -101,6 +101,8 @@ public class LibraryManager: ObservableObject {
     private let dbPool: DatabasePool
     private let publicationClock = LibraryPublicationClock()
     private var publicationOrder = LibraryPublicationOrder()
+    /// Told when removed series take their new-chapter badges with them.
+    private weak var updateManager: UpdateManager?
 
     public convenience init(dbPool: DatabasePool) {
         self.init(
@@ -118,6 +120,10 @@ public class LibraryManager: ObservableObject {
             db.add(transactionObserver: publicationClock, extent: .observerLifetime)
         }
         startObservation(scheduling: observationScheduler)
+    }
+
+    func configure(updateManager: UpdateManager) {
+        self.updateManager = updateManager
     }
 
     public func reload() async throws {
@@ -174,7 +180,7 @@ public class LibraryManager: ObservableObject {
                 pluginType: .manga,
                 rawPayload: payload,
                 anilistId: nil,
-                knownChapterCount: manga.chapters?.count ?? 0
+                knownChapterCount: manga.chapters?.distinctChapterCount ?? 0
             )
         )
     }
@@ -192,7 +198,7 @@ public class LibraryManager: ObservableObject {
                 pluginType: .anime,
                 rawPayload: payload,
                 anilistId: nil,
-                knownChapterCount: anime.episodes?.count ?? 0
+                knownChapterCount: anime.episodes?.distinctChapterCount ?? 0
             )
         )
     }
@@ -210,29 +216,36 @@ public class LibraryManager: ObservableObject {
                 pluginType: .novel,
                 rawPayload: payload,
                 anilistId: nil,
-                knownChapterCount: novel.chapters?.count ?? 0
+                knownChapterCount: novel.chapters?.distinctChapterCount ?? 0
             )
         )
     }
 
+    /// Removes a series and its new-chapter badge in one transaction.
     func removeItemDurably(id: String, pluginId: String) async throws {
-        let possibleIDs = [id, "\(pluginId)_\(id)"]
+        let candidates = [id, "\(pluginId)_\(id)"].map { ($0, MediaIdentity(pluginId: pluginId, itemId: $0)) }
         let publicationClock = publicationClock
-        let publication = try await dbPool.write { db in
-            var removedItem = false
-            for possibleID in possibleIDs {
-                guard let existing = try LibraryItem.fetchOne(db, key: possibleID),
+        let (publication, removedMedia) = try await dbPool.write { db in
+            var removedMedia: [MediaIdentity] = []
+            for (candidateID, media) in candidates {
+                guard let existing = try LibraryItem.fetchOne(db, key: candidateID),
                       existing.pluginId == pluginId else { continue }
                 try existing.delete(db)
-                removedItem = true
+                try UpdateBadgeRecord
+                    .filter(Column("pluginId") == media.pluginId)
+                    .filter(Column("canonicalMediaId") == media.canonicalMediaId)
+                    .deleteAll(db)
+                removedMedia.append(media)
             }
-            return try Self.makePublication(
+            let publication = try Self.makePublication(
                 db,
                 clock: publicationClock,
-                changedLibrary: removedItem
+                changedLibrary: !removedMedia.isEmpty
             )
+            return (publication, removedMedia)
         }
         apply(publication)
+        updateManager?.forgetBadges(for: removedMedia)
     }
 
     private func saveItemDurably(
