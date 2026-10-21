@@ -73,8 +73,8 @@ public class PluginManager: ObservableObject {
             throw URLError(.fileDoesNotExist) // Plugin not installed
         }
         // A plugin built for a newer Ito may call what this version doesn't provide.
-        guard AppVersion.isAtLeast(plugin.info.minAppVersion) else {
-            throw PluginRequiresNewerAppError(minimumAppVersion: plugin.info.minAppVersion)
+        if let refusal = plugin.info.compatibilityRefusal {
+            throw refusal
         }
         let authority = runnerAuthority(for: plugin)
 
@@ -132,7 +132,12 @@ public class PluginManager: ObservableObject {
         await runner.setWebviewModule(AppWebviewModule())
 
         AppLogger.plugin.debug("\("🔌 [PluginManager] Loading bundle for \(pluginID)")...")
-        _ = try await runner.loadBundle(from: pluginURL)
+        do {
+            _ = try await runner.loadBundle(from: pluginURL)
+        } catch ItoError.requiresNewerHost, ItoError.unsupportedABI {
+            // Plugins whose manifest predates `abi`/`imports` are only found out here.
+            throw PluginRequiresNewerAppError(minimumAppVersion: nil)
+        }
         return (runner, defaults)
     }
 

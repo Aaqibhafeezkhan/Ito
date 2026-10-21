@@ -231,7 +231,8 @@ extension PluginManager: LibraryPluginServing {
 struct DeferredPluginPackageCandidate: Equatable {
     let package: RepoPackage
     let repositoryURL: String
-    let isCompatible: Bool
+    /// Why the package can't run here, or nil when it can.
+    let incompatibility: PluginRequiresNewerAppError?
 
     var pluginType: PluginType? {
         PluginType(rawValue: package.pluginType)
@@ -257,7 +258,7 @@ extension RepoManager: DeferredPluginInstalling {
             return DeferredPluginPackageCandidate(
                 package: package,
                 repositoryURL: repository.url,
-                isCompatible: isCompatible(minAppVersion: package.minAppVersion)
+                incompatibility: compatibilityRefusal(for: package)
             )
         }
         return nil
