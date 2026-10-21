@@ -72,6 +72,10 @@ public class PluginManager: ObservableObject {
             AppLogger.plugin.debug("🔌 [PluginManager] Plugin not found: \(pluginId)")
             throw URLError(.fileDoesNotExist) // Plugin not installed
         }
+        // A plugin built for a newer Ito may call what this version doesn't provide.
+        guard AppVersion.isAtLeast(plugin.info.minAppVersion) else {
+            throw PluginRequiresNewerAppError(minimumAppVersion: plugin.info.minAppVersion)
+        }
         let authority = runnerAuthority(for: plugin)
 
         try pluginSettingsStore.prepare(pluginId: pluginId)
