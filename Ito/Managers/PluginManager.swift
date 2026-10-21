@@ -92,25 +92,68 @@ public class PluginManager: ObservableObject {
         return runner
     }
 
+    /// Loads the plugin and gives it its settings defaults. A plugin that crashes while describing
+    /// its settings is loaded again without them: that runner may be broken, but the plugin can
+    /// still read, search and update.
     @MainActor
     private static func loadRunner(
         pluginID: String,
         pluginURL: URL,
         settingsStore: PluginSettingsStore
     ) async throws -> ItoRunner {
+        let (runner, defaults) = try await makeRunner(pluginID: pluginID, pluginURL: pluginURL, settingsStore: settingsStore)
+        let usable = try await applySchemaDefaults(
+            from: { try await runner.getSettings() },
+            to: defaults,
+            pluginID: pluginID
+        )
+        if usable { return runner }
+        AppLogger.plugin.error("PluginManager: \(pluginID) crashed describing its settings; loading it again without defaults")
+        return try await makeRunner(pluginID: pluginID, pluginURL: pluginURL, settingsStore: settingsStore).runner
+    }
+
+    @MainActor
+    private static func makeRunner(
+        pluginID: String,
+        pluginURL: URL,
+        settingsStore: PluginSettingsStore
+    ) async throws -> (runner: ItoRunner, defaults: AppDefaultsModule) {
         let runner = ItoRunner()
+        let defaults = AppDefaultsModule(pluginId: pluginID, store: settingsStore)
         await runner.setNetModule(AppNetModule())
         await runner.setStdModule(DefaultStdModule())
-        await runner.setDefaultsModule(
-            AppDefaultsModule(pluginId: pluginID, store: settingsStore)
-        )
+        await runner.setDefaultsModule(defaults)
         await runner.setHtmlModule(DefaultHtmlModule())
         await runner.setJsModule(DefaultJsModule())
         await runner.setWebviewModule(AppWebviewModule())
 
         AppLogger.plugin.debug("\("🔌 [PluginManager] Loading bundle for \(pluginID)")...")
         _ = try await runner.loadBundle(from: pluginURL)
-        return runner
+        return (runner, defaults)
+    }
+
+    /// Reads the plugin's settings schema so settings the user never set read as their defaults.
+    /// Returns false when reading it crashed the plugin, so that runner must not be used. Any
+    /// other failure only leaves the plugin without defaults.
+    @MainActor
+    static func applySchemaDefaults(
+        from readSchema: () async throws -> SettingsSchema?,
+        to defaults: AppDefaultsModule,
+        pluginID: String
+    ) async throws -> Bool {
+        do {
+            if let schema = try await pluginCall(readSchema) {
+                defaults.useSchemaDefaults(schema.storedDefaults)
+            }
+            return true
+        } catch let error as PluginCallError where error.kind == .crashed {
+            return false
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            AppLogger.plugin.error("PluginManager: no settings defaults for \(pluginID); the schema couldn't be read")
+            return true
+        }
     }
 
     /// Evicts a cached runner for a plugin so the next getRunner call creates a fresh one.
