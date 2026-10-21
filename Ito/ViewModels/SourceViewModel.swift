@@ -250,7 +250,7 @@ final class SourceViewModel: ObservableObject {
         do {
             let nextContext = try await runnerProvider.sourceRunnerContext(for: plugin.id)
             try Task.checkCancellation()
-            let schema = try? await nextContext.loadSettingsSchema()
+            let schema = try await loadSettingsSchema(from: nextContext)
             try Task.checkCancellation()
             let layout = try await nextContext.loadHome()
             try Task.checkCancellation()
@@ -267,6 +267,7 @@ final class SourceViewModel: ObservableObject {
             finishLoad(operationID)
         } catch {
             guard isCurrentLoad(operationID), !Task.isCancelled else { return }
+            discardRunnerIfCrashed(error)
             let reason = error.localizedDescription
             phase = .failure(reason)
             messagePresenter.present(.loadFailed(pluginName: plugin.info.name, reason: reason))
@@ -341,6 +342,34 @@ final class SourceViewModel: ObservableObject {
         searchPhase = .failure(reason)
         messagePresenter.present(.searchFailed(pluginName: plugin.info.name, reason: reason))
         finishSearch(operationID)
+        if discardRunnerIfCrashed(error) {
+            // Load the source again so the next search runs on a new runner.
+            Task { [weak self] in await self?.load(invalidateCachedRunner: false) }
+        }
+    }
+
+    /// The plugin's settings schema, or nil when it has none or can't provide one. A crash is not
+    /// swallowed: the home would otherwise load on the crashed runner.
+    private func loadSettingsSchema(from context: any SourceRunnerContext) async throws -> SettingsSchema? {
+        do {
+            return try await context.loadSettingsSchema()
+        } catch let error as PluginCallError where error.kind == .crashed {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return nil
+        }
+    }
+
+    /// A plugin that crashed may be left in a broken state, so its cached runner and the context
+    /// holding it are dropped, and the next call starts a new one.
+    @discardableResult
+    private func discardRunnerIfCrashed(_ error: any Error) -> Bool {
+        guard (error as? PluginCallError)?.kind == .crashed else { return false }
+        runnerProvider.evictSourceRunner(for: plugin.id)
+        context = nil
+        return true
     }
 
     private func restoreAfterFailedDeletion(
