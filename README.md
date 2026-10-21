@@ -44,13 +44,13 @@ Unsigned builds are published for sideloading. [atiinlabs.github.io/Ito](https:/
 ## Showcase
 
 <p align="center">
-  <img src="assets/screenshots/details.png" alt="Media details" width="23%" />
+  <img src="assets/screenshots/library.png" alt="Library with custom lists" width="23%" />
   &nbsp;
-  <img src="assets/screenshots/reader.png" alt="Manga reader" width="23%" />
+  <img src="assets/screenshots/details.png" alt="Anime details with the episode list" width="23%" />
   &nbsp;
-  <img src="assets/screenshots/discover.png" alt="Discover view" width="23%" />
+  <img src="assets/screenshots/reader.png" alt="Webtoon reader" width="23%" />
   &nbsp;
-  <img src="assets/screenshots/library.png" alt="Library view" width="23%" />
+  <img src="assets/screenshots/novel.png" alt="Novel reader" width="23%" />
 </p>
 
 ## Supported imports
