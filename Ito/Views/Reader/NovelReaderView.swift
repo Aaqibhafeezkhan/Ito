@@ -5,19 +5,19 @@ struct NovelReaderView: View {
     @StateObject private var viewModel: NovelReaderViewModel
     @State private var showUI = true
     @State private var showSettings = false
+    /// Screen brightness before the reader's slider first changed it; put back on close.
+    @State private var brightnessBeforeReading: CGFloat?
 
     @Environment(\.dismiss) private var dismiss
 
-    init(viewModel: NovelReaderViewModel) {
-        _viewModel = StateObject(wrappedValue: viewModel)
+    /// `viewModel` is evaluated once, when SwiftUI first creates this view's state.
+    init(viewModel: @autoclosure @escaping () -> NovelReaderViewModel) {
+        _viewModel = StateObject(wrappedValue: viewModel())
     }
 
     var body: some View {
         GeometryReader { geometry in
             readerBody(
-                safeAreaTop: geometry.safeAreaInsets.top > 0
-                    ? geometry.safeAreaInsets.top
-                    : 44,
                 safeAreaBottom: geometry.safeAreaInsets.bottom > 0
                     ? geometry.safeAreaInsets.bottom
                     : 34
@@ -27,37 +27,45 @@ struct NovelReaderView: View {
         .statusBarHidden(!showUI)
         .task { viewModel.start() }
         .onAppear { viewModel.appear() }
-        .onDisappear { viewModel.disappear() }
+        .onDisappear {
+            viewModel.disappear()
+            if let brightnessBeforeReading {
+                UIScreen.main.brightness = brightnessBeforeReading
+                self.brightnessBeforeReading = nil
+            }
+        }
     }
 
     private func readerBody(
-        safeAreaTop: CGFloat,
         safeAreaBottom: CGFloat
     ) -> some View {
         ZStack {
             viewModel.theme.backgroundColor.edgesIgnoringSafeArea(.all)
 
             switch viewModel.loadPhase {
+            // These sit on the reading theme's background, so they use its text colour too.
             case .idle, .loading:
-                VStack {
-                    ProgressView("Loading Chapter...")
-                }
+                ProgressView("Loading Chapter...")
+                    .tint(viewModel.theme.textColor)
+                    .foregroundColor(viewModel.theme.textColor)
             case .failure(let error):
-                VStack {
+                VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle")
-                        .foregroundColor(.red)
                         .font(.largeTitle)
-                    Text("Failed to load chapter")
+                        .foregroundColor(viewModel.theme.textColor.opacity(0.7))
+                    Text("Couldn't load this chapter")
                         .font(.headline)
-                        .padding(.top)
+                        .foregroundColor(viewModel.theme.textColor)
                     Text(error)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                        .font(.footnote)
+                        .foregroundColor(viewModel.theme.textColor.opacity(0.6))
                         .multilineTextAlignment(.center)
-                        .padding()
                     Button("Try Again") { viewModel.retry() }
-                        .padding()
+                        .buttonStyle(.bordered)
+                        .tint(viewModel.theme.textColor)
+                        .padding(.top, 4)
                 }
+                .padding(32)
             case .content:
                 readerContent(safeAreaBottom: safeAreaBottom)
             }
@@ -67,7 +75,6 @@ struct NovelReaderView: View {
                     NovelReaderHeaderView(
                         title: viewModel.novel.title,
                         chapterTitle: chapterTitle(viewModel.currentChapter),
-                        safeAreaTop: safeAreaTop,
                         onDismiss: { dismiss() }
                     )
 
@@ -107,56 +114,138 @@ struct NovelReaderView: View {
                 theme: viewModel.theme,
                 prefetchChapters: viewModel.prefetchChapters,
                 onLoadNextChapter: { viewModel.loadNextChapter() },
+                appendFailed: viewModel.appendFailed,
+                onRetryNextChapter: { viewModel.retryNextChapter() },
                 currentChapter: Binding(
                     get: { viewModel.currentChapter },
                     set: { viewModel.pagedChapterChanged($0) }
-                )
+                ),
+                restoreAnchor: viewModel.restoreAnchor,
+                onRestoreAnchorApplied: { viewModel.consumeRestoreAnchor($0) },
+                onPositionChanged: { chapterID, offset, isLast in
+                    // A layout finishing after a switch to scrolling must not move the place.
+                    guard viewModel.isPaging else { return }
+                    viewModel.readingPositionChanged(
+                        chapterID: chapterID,
+                        offset: offset,
+                        reachedEnd: isLast
+                    )
+                }
             )
             .simultaneousGesture(toggleUIGesture)
         } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: CGFloat(viewModel.lineSpacing)) {
-                    ForEach(viewModel.loadedChapters) { loadedChapter in
-                        Text(chapterTitle(loadedChapter.chapter))
-                            .font(
-                                viewModel.fontFamily.swiftUIFont(
-                                    size: CGFloat(viewModel.fontSize) + 6,
-                                    weight: .bold
+            ScrollViewReader { proxy in
+                ScrollView {
+                    // Paragraphs are a line apart, like the blank line between them in paged mode.
+                    LazyVStack(alignment: .leading, spacing: CGFloat(viewModel.fontSize)) {
+                        ForEach(viewModel.loadedChapters) { loadedChapter in
+                            Text(chapterTitle(loadedChapter.chapter))
+                                .font(
+                                    viewModel.fontFamily.swiftUIFont(
+                                        size: CGFloat(viewModel.fontSize) + 6,
+                                        weight: .bold
+                                    )
                                 )
-                            )
-                            .foregroundColor(viewModel.theme.textColor)
-                            .padding(.vertical)
-                            .padding(.horizontal)
-                            .onAppear {
-                                viewModel.continuousChapterTitleAppeared(loadedChapter)
+                                .foregroundColor(viewModel.theme.textColor)
+                                .padding(.vertical)
+                                .padding(.horizontal)
+                                .onAppear {
+                                    viewModel.continuousChapterTitleAppeared(loadedChapter)
+                                }
+                                .onDisappear {
+                                    viewModel.continuousChapterTitleDisappeared(loadedChapter)
+                                }
+
+                            ForEach(Array(loadedChapter.pages.enumerated()), id: \.offset) { index, page in
+                                pageText(for: page)
+                                    .id(blockID(loadedChapter.id, index))
+                                    .onAppear {
+                                        viewModel.continuousPageAppeared(
+                                            chapterID: loadedChapter.id,
+                                            pageIndex: index
+                                        )
+                                    }
+                                    .onDisappear {
+                                        viewModel.continuousPageDisappeared(
+                                            chapterID: loadedChapter.id,
+                                            pageIndex: index
+                                        )
+                                    }
                             }
 
-                        let pages = loadedChapter.pages
-                        ForEach(Array(pages.enumerated()), id: \.element.index) { index, page in
-                            pageText(for: page)
+                            // Only scrolls into view at the end of the chapter's text.
+                            Color.clear
+                                .frame(height: 1)
                                 .onAppear {
-                                    viewModel.continuousPageAppeared(
-                                        chapterID: loadedChapter.id,
-                                        pageIndex: index
-                                    )
+                                    viewModel.continuousChapterEndAppeared(chapterID: loadedChapter.id)
+                                }
+                                .onDisappear {
+                                    viewModel.continuousChapterEndDisappeared(chapterID: loadedChapter.id)
                                 }
                         }
-                    }
+                        // On the text only, so tapping the end row's buttons leaves the controls.
+                        .simultaneousGesture(toggleUIGesture)
 
-                    if viewModel.isLoadingNext {
-                        HStack {
-                            Spacer()
-                            ProgressView()
-                                .padding()
-                            Spacer()
-                        }
-                    }
+                        endOfListRow
 
-                    Color.clear.frame(height: safeAreaBottom + 80)
+                        Color.clear.frame(height: safeAreaBottom + 80)
+                    }
+                }
+                .onAppear { applyRestoreAnchor(with: proxy) }
+                .onChange(of: viewModel.restoreAnchor) { _ in applyRestoreAnchor(with: proxy) }
+            }
+        }
+    }
+
+    /// After the last loaded chapter: loading, a failed load to retry, or (with Seamless
+    /// Reading off) a button that adds the next chapter below.
+    @ViewBuilder
+    private var endOfListRow: some View {
+        if viewModel.isLoadingNext {
+            ProgressView()
+                .tint(viewModel.theme.textColor)
+                .frame(maxWidth: .infinity)
+                .padding()
+        } else if let last = viewModel.loadedChapters.last,
+                  let next = viewModel.chapterAfter(last.chapter) {
+            if viewModel.appendFailed {
+                VStack(spacing: 8) {
+                    Text("Couldn't load the next chapter")
+                        .font(.subheadline)
+                        .foregroundColor(viewModel.theme.textColor)
+                    Button("Try Again") { viewModel.retryNextChapter() }
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+            } else if !viewModel.prefetchChapters {
+                Button(action: { viewModel.loadNextChapter() }) {
+                    VStack(spacing: 4) {
+                        Text("Next Chapter")
+                            .font(.caption.weight(.semibold))
+                            .textCase(.uppercase)
+                        Text(chapterTitle(next))
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                    }
+                    .foregroundColor(viewModel.theme.textColor)
+                    .frame(maxWidth: .infinity)
+                    .padding()
                 }
             }
-            .simultaneousGesture(toggleUIGesture)
         }
+    }
+
+    private func blockID(_ chapterID: UUID, _ index: Int) -> String {
+        "\(chapterID.uuidString)#\(index)"
+    }
+
+    private func applyRestoreAnchor(with proxy: ScrollViewProxy) {
+        guard let anchor = viewModel.restoreAnchor,
+              let loaded = viewModel.loadedChapters.first(where: { $0.id == anchor.chapterID })
+        else { return }
+        let block = NovelTextOffsets.blockIndex(containing: anchor.offset, in: loaded.pages)
+        proxy.scrollTo(blockID(anchor.chapterID, block), anchor: .top)
+        viewModel.consumeRestoreAnchor(anchor)
     }
 
     private var toggleUIGesture: some Gesture {
@@ -171,11 +260,9 @@ struct NovelReaderView: View {
         ZStack {
             Color.black.opacity(0.4)
                 .edgesIgnoringSafeArea(.all)
-                .onTapGesture {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        showSettings = false
-                    }
-                }
+                .onTapGesture(perform: closeSettings)
+                .accessibilityLabel("Close Settings")
+                .accessibilityAddTraits(.isButton)
                 .transition(.opacity)
                 .zIndex(10)
 
@@ -206,9 +293,15 @@ struct NovelReaderView: View {
                     prefetchChapters: Binding(
                         get: { viewModel.prefetchChapters },
                         set: { viewModel.setPrefetchChapters($0) }
-                    )
+                    ),
+                    onBrightnessChange: { value in
+                        if brightnessBeforeReading == nil {
+                            brightnessBeforeReading = UIScreen.main.brightness
+                        }
+                        UIScreen.main.brightness = value
+                    }
                 )
-                .frame(height: 280)
+                // No fixed height: the panel grows with larger text sizes.
                 .padding(.bottom, safeAreaBottom)
                 .background(Color(UIColor.systemBackground))
                 .cornerRadius(24)
@@ -217,6 +310,13 @@ struct NovelReaderView: View {
             .edgesIgnoringSafeArea(.bottom)
             .transition(.move(edge: .bottom))
             .zIndex(11)
+        }
+        .accessibilityAction(.escape, closeSettings)
+    }
+
+    private func closeSettings() {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showSettings = false
         }
     }
 
@@ -227,12 +327,13 @@ struct NovelReaderView: View {
             SelectableTextView(
                 text: text,
                 font: viewModel.fontFamily.uiFont(size: CGFloat(viewModel.fontSize)),
-                textColor: UIColor(viewModel.theme.textColor)
+                textColor: UIColor(viewModel.theme.textColor),
+                lineSpacing: CGFloat(viewModel.lineSpacing)
             )
             .padding(.horizontal)
             .padding(.vertical, 4)
         case .url(let urlString):
-            MangaImage(urlStr: urlString, headers: page.headers)
+            MangaImage(urlStr: urlString, headers: page.headers, foreground: viewModel.theme.textColor)
                 .padding(.horizontal)
         }
     }
@@ -253,7 +354,6 @@ struct NovelReaderView: View {
 private struct NovelReaderHeaderView: View {
     let title: String
     let chapterTitle: String
-    let safeAreaTop: CGFloat
     let onDismiss: () -> Void
 
     var body: some View {
@@ -284,9 +384,11 @@ private struct NovelReaderHeaderView: View {
                     .background(.ultraThinMaterial, in: Circle())
                     .environment(\.colorScheme, .dark)
             }
+            .accessibilityLabel("Close Reader")
         }
         .padding(.horizontal)
-        .padding(.top, safeAreaTop)
+        // The header's container already keeps clear of the top safe area.
+        .padding(.top, 8)
     }
 }
 
@@ -307,8 +409,9 @@ private struct NovelReaderFooterView: View {
                         .font(.body.weight(.semibold))
                         .foregroundColor(.white)
                 }
+                .accessibilityLabel("Previous Chapter")
             } else {
-                Color.clear.frame(width: 16, height: 16)
+                Color.clear.frame(width: 16, height: 16).accessibilityHidden(true)
             }
 
             Spacer()
@@ -318,6 +421,7 @@ private struct NovelReaderFooterView: View {
                     .font(.title3.weight(.semibold))
                     .foregroundColor(.white)
             }
+            .accessibilityLabel("Reader Settings")
 
             Spacer()
 
@@ -327,8 +431,9 @@ private struct NovelReaderFooterView: View {
                         .font(.body.weight(.semibold))
                         .foregroundColor(.white)
                 }
+                .accessibilityLabel("Next Chapter")
             } else {
-                Color.clear.frame(width: 16, height: 16)
+                Color.clear.frame(width: 16, height: 16).accessibilityHidden(true)
             }
         }
         .padding(.horizontal, 24)
@@ -336,7 +441,7 @@ private struct NovelReaderFooterView: View {
         .background(.ultraThinMaterial, in: Capsule())
         .environment(\.colorScheme, .dark)
         .padding(.horizontal, 20)
-        .padding(.bottom, safeAreaBottom > 0 ? safeAreaBottom : 16)
+        .padding(.bottom, safeAreaBottom)
     }
 }
 
@@ -409,7 +514,7 @@ enum NovelFont: String, CaseIterable, Identifiable {
         }
     }
 
-    func uiFont(size: CGFloat, isBold: Bool = false) -> UIFont {
+    nonisolated func uiFont(size: CGFloat, isBold: Bool = false) -> UIFont {
         let fallback = isBold ? UIFont.boldSystemFont(ofSize: size) : UIFont.systemFont(ofSize: size)
         switch self {
         case .system, .rounded: return fallback
@@ -429,8 +534,20 @@ struct SelectableTextView: UIViewRepresentable {
     let text: String
     let font: UIFont
     let textColor: UIColor
+    /// Space between lines, as in paged mode.
+    let lineSpacing: CGFloat
+
+    struct Style: Equatable {
+        let text: String
+        let font: UIFont
+        let textColor: UIColor
+        let lineSpacing: CGFloat
+    }
 
     class SelfSizingTextView: UITextView {
+        var appliedStyle: Style?
+        private var measuredWidth: CGFloat = 0
+
         override var intrinsicContentSize: CGSize {
             let size = sizeThatFits(CGSize(width: bounds.width > 0 ? bounds.width : UIScreen.main.bounds.width, height: .greatestFiniteMagnitude))
             return size
@@ -438,7 +555,9 @@ struct SelectableTextView: UIViewRepresentable {
 
         override func layoutSubviews() {
             super.layoutSubviews()
-            if bounds.size != intrinsicContentSize {
+            // Height follows width: measure again only when the width actually changed.
+            if bounds.width != measuredWidth {
+                measuredWidth = bounds.width
                 invalidateIntrinsicContentSize()
             }
         }
@@ -466,10 +585,22 @@ struct SelectableTextView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: SelfSizingTextView, context: Context) {
-        if uiView.text != text { uiView.text = text }
-        if uiView.font != font { uiView.font = font }
-        if uiView.textColor != textColor { uiView.textColor = textColor }
-        uiView.invalidateIntrinsicContentSize()
+        let style = Style(text: text, font: font, textColor: textColor, lineSpacing: lineSpacing)
+        guard uiView.appliedStyle != style else { return }
+        // Colour alone does not change the text's height.
+        let sizeChanged = uiView.appliedStyle.map {
+            $0.text != text || $0.font != font || $0.lineSpacing != lineSpacing
+        } ?? true
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = lineSpacing
+        uiView.attributedText = NSAttributedString(
+            string: text,
+            attributes: [.font: font, .foregroundColor: textColor, .paragraphStyle: paragraph]
+        )
+        uiView.appliedStyle = style
+        if sizeChanged {
+            uiView.invalidateIntrinsicContentSize()
+        }
     }
 }
 
@@ -480,6 +611,8 @@ struct NovelReaderSettingsView: View {
     @Binding var theme: NovelTheme
     @Binding var isPaging: Bool
     @Binding var prefetchChapters: Bool
+    /// Sets the screen brightness; the reader puts the old value back when it closes.
+    let onBrightnessChange: (CGFloat) -> Void
 
     @State private var activeTab: SettingsTab = .typography
     @State private var brightness: CGFloat = UIScreen.main.brightness
@@ -502,42 +635,39 @@ struct NovelReaderSettingsView: View {
                     readingTab
                 }
             }
-            .frame(height: 170, alignment: .top)
+            // A minimum, not a fixed height, so larger text sizes are not cut off.
+            .frame(minHeight: 170, alignment: .top)
 
             // Bottom Toolbar (Footer)
             HStack {
                 Spacer()
 
-                Button(action: { activeTab = .typography }) {
-                    Image(systemName: "textformat")
-                        .font(.title2)
-                        .frame(width: 60, height: 44)
-                        .foregroundColor(activeTab == .typography ? .primary : Color(UIColor.tertiaryLabel))
-                }
+                tabButton(.typography, systemName: "textformat", label: "Text")
 
                 Spacer()
 
-                Button(action: { activeTab = .theme }) {
-                    Image(systemName: "sun.max.fill")
-                        .font(.title2)
-                        .frame(width: 60, height: 44)
-                        .foregroundColor(activeTab == .theme ? .primary : Color(UIColor.tertiaryLabel))
-                }
+                tabButton(.theme, systemName: "sun.max.fill", label: "Appearance")
 
                 Spacer()
 
-                Button(action: { activeTab = .reading }) {
-                    Image(systemName: "book.fill")
-                        .font(.title2)
-                        .frame(width: 60, height: 44)
-                        .foregroundColor(activeTab == .reading ? .primary : Color(UIColor.tertiaryLabel))
-                }
+                tabButton(.reading, systemName: "book.fill", label: "Reading")
 
                 Spacer()
             }
             .padding(.bottom, 24)
         }
         .background(Color(UIColor.systemBackground))
+    }
+
+    private func tabButton(_ tab: SettingsTab, systemName: String, label: String) -> some View {
+        Button(action: { activeTab = tab }) {
+            Image(systemName: systemName)
+                .font(.title2)
+                .frame(width: 60, height: 44)
+                .foregroundColor(activeTab == tab ? .primary : Color(UIColor.tertiaryLabel))
+        }
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(activeTab == tab ? .isSelected : [])
     }
 
     private var typographyTab: some View {
@@ -550,6 +680,7 @@ struct NovelReaderSettingsView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color(UIColor.secondarySystemBackground))
                 }
+                .accessibilityLabel("Larger Text")
 
                 Divider()
 
@@ -559,6 +690,7 @@ struct NovelReaderSettingsView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color(UIColor.tertiarySystemBackground))
                 }
+                .accessibilityLabel("Smaller Text")
             }
             .foregroundColor(.primary)
             .frame(width: 70, height: 140)
@@ -592,7 +724,7 @@ struct NovelReaderSettingsView: View {
                             .foregroundColor(.secondary)
                     }
                     .padding()
-                    .frame(height: 62)
+                    .frame(minHeight: 62)
                     .background(Color(UIColor.secondarySystemBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
@@ -605,11 +737,12 @@ struct NovelReaderSettingsView: View {
                             Text("Scrolling")
                                 .font(.caption.weight(.medium))
                         }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .frame(maxWidth: .infinity, minHeight: 54)
                         .background(!isPaging ? Color(UIColor.secondarySystemBackground) : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         .foregroundColor(!isPaging ? .primary : .secondary)
                     }
+                    .accessibilityAddTraits(!isPaging ? .isSelected : [])
 
                     Button(action: { isPaging = true }) {
                         VStack(spacing: 4) {
@@ -617,14 +750,15 @@ struct NovelReaderSettingsView: View {
                             Text("Paging")
                                 .font(.caption.weight(.medium))
                         }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .frame(maxWidth: .infinity, minHeight: 54)
                         .background(isPaging ? Color(UIColor.secondarySystemBackground) : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         .foregroundColor(isPaging ? .primary : .secondary)
                     }
+                    .accessibilityAddTraits(isPaging ? .isSelected : [])
                 }
                 .padding(4)
-                .frame(height: 62)
+                .frame(minHeight: 62)
                 .background(Color(UIColor.systemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .overlay(
@@ -673,6 +807,8 @@ struct NovelReaderSettingsView: View {
                         }
                         .frame(width: 50, height: 50)
                     }
+                    .accessibilityLabel("\(t.rawValue) theme")
+                    .accessibilityAddTraits(theme == t ? .isSelected : [])
                     Spacer()
                 }
             }
@@ -713,12 +849,26 @@ struct NovelReaderSettingsView: View {
 
                             if abs(brightness - newBrightness) > 0.01 {
                                 brightness = newBrightness
-                                UIScreen.main.brightness = newBrightness
+                                onBrightnessChange(newBrightness)
                             }
                         }
                 )
             }
             .frame(height: 60)
+            // VoiceOver: one adjustable control, swiped up or down in steps of 10%.
+            .accessibilityElement()
+            .accessibilityLabel("Brightness")
+            .accessibilityValue("\(Int((brightness * 100).rounded())) percent")
+            .accessibilityAdjustableAction { direction in
+                let step: CGFloat
+                switch direction {
+                case .increment: step = 0.1
+                case .decrement: step = -0.1
+                @unknown default: return
+                }
+                brightness = max(0, min(1, brightness + step))
+                onBrightnessChange(brightness)
+            }
             .onAppear {
                 brightness = UIScreen.main.brightness
             }
@@ -727,7 +877,7 @@ struct NovelReaderSettingsView: View {
     }
 
     private var readingTab: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 12) {
             Toggle(isOn: $prefetchChapters) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Seamless Reading")
@@ -739,6 +889,37 @@ struct NovelReaderSettingsView: View {
                 }
             }
             .tint(Color.primary)
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            HStack {
+                Text("Line Spacing")
+                    .font(.headline)
+                    .foregroundColor(.primary)
+
+                Spacer()
+
+                Button(action: { lineSpacing -= 2 }) {
+                    Image(systemName: "minus")
+                        .frame(width: 36, height: 36)
+                }
+                .disabled(lineSpacing <= NovelReaderViewModel.lineSpacingRange.lowerBound)
+                .accessibilityLabel("Less Line Spacing")
+
+                Text("\(Int(lineSpacing))")
+                    .font(.body.monospacedDigit())
+                    .frame(minWidth: 28)
+                    .accessibilityLabel("Line spacing \(Int(lineSpacing))")
+
+                Button(action: { lineSpacing += 2 }) {
+                    Image(systemName: "plus")
+                        .frame(width: 36, height: 36)
+                }
+                .disabled(lineSpacing >= NovelReaderViewModel.lineSpacingRange.upperBound)
+                .accessibilityLabel("More Line Spacing")
+            }
+            .foregroundColor(.primary)
             .padding()
             .background(Color(UIColor.secondarySystemBackground))
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))

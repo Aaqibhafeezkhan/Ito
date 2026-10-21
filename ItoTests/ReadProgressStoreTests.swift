@@ -119,6 +119,93 @@ struct ReadProgressStoreTests {
         }
     }
 
+    @Test func positionIsSavedPerLastChapterAndSurvivesReload() async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let manager = ReadProgressManager(dbPool: database.dbPool)
+        let media = MediaIdentity(pluginId: "plugin", canonicalMediaId: "media")
+
+        try await manager.savePosition(media: media, chapterKey: "chapter-3", position: 12)
+
+        #expect(manager.savedPosition(media: media, chapterKey: "chapter-3") == 12)
+        #expect(manager.savedPosition(media: media, chapterKey: "chapter-4") == nil)
+        #expect(manager.lastReadChapter(for: media) == "chapter-3")
+        #expect(!manager.isRead(media: media, chapterId: "chapter-3"))
+
+        let reloaded = ReadProgressManager(dbPool: database.dbPool)
+        try await reloaded.reload()
+        #expect(reloaded.savedPosition(media: media, chapterKey: "chapter-3") == 12)
+    }
+
+    @Test func markingAChapterReadNeverMovesTheReadingPlace() async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let manager = ReadProgressManager(dbPool: database.dbPool)
+        let media = MediaIdentity(pluginId: "plugin", canonicalMediaId: "media")
+
+        // A series with no reading state starts it at the chapter marked read.
+        try await manager.markAsRead(media: media, chapterId: "chapter-1", chapterNum: 1)
+        #expect(manager.lastReadChapter(for: media) == "chapter-1")
+
+        try await manager.savePosition(media: media, chapterKey: "chapter-3", position: 19)
+        try await manager.markAsRead(media: media, chapterId: "chapter-3", chapterNum: 3)
+        #expect(manager.savedPosition(media: media, chapterKey: "chapter-3") == 19)
+
+        // The reader moved on to chapter 4 before chapter 3's read mark landed.
+        try await manager.savePosition(media: media, chapterKey: "chapter-4", position: 2)
+        try await manager.markAsRead(media: media, chapterId: "chapter-3", chapterNum: 3)
+        #expect(manager.isRead(media: media, chapterId: "chapter-3", chapterNum: 3))
+        let reloaded = ReadProgressManager(dbPool: database.dbPool)
+        try await reloaded.reload()
+        #expect(reloaded.lastReadChapter(for: media) == "chapter-4")
+        #expect(reloaded.savedPosition(media: media, chapterKey: "chapter-4") == 2)
+    }
+
+    @Test func readingModeSurvivesPositionAndReadWritesAndReload() async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let manager = ReadProgressManager(dbPool: database.dbPool)
+        let media = MediaIdentity(pluginId: "plugin", canonicalMediaId: "media")
+
+        // No reading state yet: choosing a mode starts it at the chapter being read.
+        try await manager.saveReaderViewer(4, media: media, chapterKey: "chapter-1")
+        #expect(manager.lastReadChapter(for: media) == "chapter-1")
+
+        try await manager.savePosition(media: media, chapterKey: "chapter-2", position: 5)
+        try await manager.markAsRead(media: media, chapterId: "chapter-2", chapterNum: 2)
+        #expect(manager.savedReaderViewer(media: media) == 4)
+
+        let reloaded = ReadProgressManager(dbPool: database.dbPool)
+        try await reloaded.reload()
+        #expect(reloaded.savedReaderViewer(media: media) == 4)
+        #expect(reloaded.savedPosition(media: media, chapterKey: "chapter-2") == 5)
+
+        try await reloaded.saveReaderViewer(nil, media: media, chapterKey: "chapter-9")
+        #expect(reloaded.savedReaderViewer(media: media) == nil)
+        // An existing reading state keeps its chapter.
+        #expect(reloaded.lastReadChapter(for: media) == "chapter-2")
+    }
+
+    @Test func rowsWithoutThePositionColumnDecodeWithNoPosition() throws {
+        // Backups made before v10 have no lastReadPosition column.
+        let queue = try DatabaseQueue()
+        let record = try queue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE mediaReadProgress (
+                    pluginId TEXT NOT NULL, canonicalMediaId TEXT NOT NULL,
+                    lastReadChapterKey TEXT NOT NULL, updatedAt DATETIME, provenance TEXT
+                )
+                """)
+            try db.execute(sql: """
+                INSERT INTO mediaReadProgress (pluginId, canonicalMediaId, lastReadChapterKey)
+                VALUES ('plugin', 'media', 'chapter')
+                """)
+            return try MediaReadProgressRecord.fetchOne(db)
+        }
+        #expect(record?.lastReadChapterKey == "chapter")
+        #expect(record?.lastReadPosition == nil)
+    }
+
     private func expectMarkUpToNoOp(maxChapterNum: Float) async throws {
         let database = try TestDatabase()
         defer { database.cleanup() }

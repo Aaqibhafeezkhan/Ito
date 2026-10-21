@@ -1,6 +1,5 @@
 import SwiftUI
 import UIKit
-import os
 import ito_runner
 
 struct NovelPagingReaderView: View {
@@ -11,17 +10,25 @@ struct NovelPagingReaderView: View {
     let theme: NovelTheme
     let prefetchChapters: Bool
     let onLoadNextChapter: () -> Void
+    /// The next chapter failed to load; `onRetryNextChapter` tries again.
+    let appendFailed: Bool
+    let onRetryNextChapter: () -> Void
     @Binding var currentChapter: Novel.Chapter
+    /// A place to open at once pages exist; reported back through `onRestoreAnchorApplied`.
+    let restoreAnchor: NovelReadingAnchor?
+    let onRestoreAnchorApplied: (NovelReadingAnchor) -> Void
+    /// Called with the chapter, offset and whether the page is the chapter's last.
+    let onPositionChanged: (UUID, Int, Bool) -> Void
 
-    struct PagedItem {
-        let chapter: Novel.Chapter
-        let string: NSAttributedString
-    }
-
-    @State private var paginatedCache: [UUID: [NSAttributedString]] = [:]
-    @State private var flattenedPages: [PagedItem] = []
+    @State private var paginatedCache: [UUID: [NovelPaginationPage]] = [:]
+    @State private var flattenedPages: [NovelPaginationPage] = []
     @State private var currentPageIndex: Int = 0
     @State private var pageSize: CGSize = .zero
+    /// Bumped for each pagination request; a result from an older request is dropped.
+    @State private var paginationGeneration = 0
+    @State private var paginationTask: Task<Void, Never>?
+    /// The off-main layout itself; cancelled when a newer request replaces it.
+    @State private var layoutTask: Task<[NovelPaginationPage]?, Never>?
 
     var body: some View {
         GeometryReader { geo in
@@ -30,18 +37,22 @@ struct NovelPagingReaderView: View {
             ZStack {
                 if flattenedPages.isEmpty {
                     ProgressView("Paginating...")
+                        .tint(theme.textColor)
+                        .foregroundColor(theme.textColor)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     PageViewController(
-                        pages: flattenedPages.map { $0.string },
+                        pages: flattenedPages,
                         currentPage: $currentPageIndex,
                         maxWidth: max(0, size.width - 32),
+                        textColor: theme.textColor,
                         onPageChanged: { newIndex in
                             if newIndex >= 0 && newIndex < flattenedPages.count {
                                 let newChap = flattenedPages[newIndex].chapter
                                 if newChap.key != currentChapter.key {
                                     currentChapter = newChap
                                 }
+                                reportPosition(of: flattenedPages, at: newIndex)
 
                                 // Prefetch trigger
                                 if prefetchChapters && newIndex >= flattenedPages.count - 3 {
@@ -60,7 +71,7 @@ struct NovelPagingReaderView: View {
 
                             Spacer()
 
-                            Text("\(currentPageIndex + 1)/\(flattenedPages.count)")
+                            Text(Self.chapterPageLabel(of: flattenedPages, at: currentPageIndex))
                                 .font(.system(size: 11, weight: .regular, design: .monospaced))
                                 .foregroundColor(theme.textColor.opacity(0.5))
                                 .padding(.trailing, 16)
@@ -68,114 +79,179 @@ struct NovelPagingReaderView: View {
                         .padding(.bottom, 8)
                     }
                     .allowsHitTesting(false)
+
+                    if appendFailed && currentPageIndex >= flattenedPages.count - 3 {
+                        VStack {
+                            Spacer()
+                            HStack(spacing: 12) {
+                                Text("Couldn't load the next chapter")
+                                    .font(.footnote)
+                                Button("Try Again", action: onRetryNextChapter)
+                                    .font(.footnote.weight(.semibold))
+                            }
+                            .foregroundColor(theme.textColor)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(theme.backgroundColor.opacity(0.95), in: Capsule())
+                            .overlay(Capsule().stroke(theme.textColor.opacity(0.2), lineWidth: 1))
+                            .padding(.bottom, 32)
+                        }
+                    }
                 }
             }
             .onAppear {
                 if pageSize == .zero && size.width > 0 {
                     pageSize = size
-                    DispatchQueue.main.async { paginate(size: size) }
+                    repaginate(configuration(size: size))
                 }
             }
+            // Each change passes its new value: the view's own copy may not have caught up yet.
             .onChange(of: size) { newSize in
-                AppLogger.ui.debug("[NovelPagingReaderView] onChange(of: size) triggered: \(String(describing: newSize))")
-                if newSize != pageSize {
-                    pageSize = newSize
-                    paginatedCache.removeAll()
-                    DispatchQueue.main.async { paginate(size: newSize) }
-                }
+                guard newSize != pageSize else { return }
+                pageSize = newSize
+                repaginate(configuration(size: newSize), discardingLayout: true)
             }
             .onChange(of: loadedChapters) { _ in
-                DispatchQueue.main.async { paginate(size: pageSize) }
+                repaginate(configuration())
             }
             .onChange(of: fontSize) { newSize in
-                AppLogger.ui.debug("[NovelPagingReaderView] onChange(of: fontSize) to \(newSize)")
-                paginatedCache.removeAll()
-                DispatchQueue.main.async { paginate(size: pageSize, overrideFontSize: newSize) }
+                repaginate(configuration(fontSize: newSize), discardingLayout: true)
             }
-            .onChange(of: fontFamily) { newFam in
-                AppLogger.ui.debug("[NovelPagingReaderView] onChange(of: fontFamily) to \(String(describing: newFam))")
-                paginatedCache.removeAll()
-                DispatchQueue.main.async { paginate(size: pageSize, overrideFontFamily: newFam) }
+            .onChange(of: fontFamily) { newFamily in
+                repaginate(configuration(fontFamily: newFamily), discardingLayout: true)
             }
-            .onChange(of: lineSpacing) { newSpace in
-                AppLogger.ui.debug("[NovelPagingReaderView] onChange(of: lineSpacing) to \(newSpace)")
-                paginatedCache.removeAll()
-                DispatchQueue.main.async { paginate(size: pageSize, overrideLineSpacing: newSpace) }
+            .onChange(of: lineSpacing) { newSpacing in
+                repaginate(configuration(lineSpacing: newSpacing), discardingLayout: true)
             }
             .onChange(of: theme) { newTheme in
-                AppLogger.ui.debug("[NovelPagingReaderView] onChange(of: theme) to \(String(describing: newTheme))")
-                paginatedCache.removeAll()
-                DispatchQueue.main.async { paginate(size: pageSize, overrideTheme: newTheme) }
+                // Colour does not move page breaks: recolour the laid-out pages instead.
+                let color = UIColor(newTheme.textColor)
+                paginatedCache = paginatedCache.mapValues { $0.map { $0.recolored(color) } }
+                repaginate(configuration(theme: newTheme))
+            }
+            .onDisappear {
+                paginationTask?.cancel()
+                layoutTask?.cancel()
             }
         }
     }
 
-    private func paginate(
-        size: CGSize,
-        overrideFontSize: Double? = nil,
-        overrideFontFamily: NovelFont? = nil,
-        overrideLineSpacing: Double? = nil,
-        overrideTheme: NovelTheme? = nil
+    private func configuration(
+        size: CGSize? = nil,
+        fontSize: Double? = nil,
+        fontFamily: NovelFont? = nil,
+        lineSpacing: Double? = nil,
+        theme: NovelTheme? = nil
+    ) -> NovelPaginationConfiguration {
+        NovelPaginationConfiguration(
+            containerSize: size ?? pageSize,
+            fontSize: fontSize ?? self.fontSize,
+            fontFamily: fontFamily ?? self.fontFamily,
+            lineSpacing: lineSpacing ?? self.lineSpacing,
+            textColor: UIColor((theme ?? self.theme).textColor)
+        )
+    }
+
+    /// Lays out chapters that have no pages yet, off the main thread, then shows the pages at
+    /// the reader's current place. `discardingLayout` lays every chapter out again.
+    private func repaginate(
+        _ configuration: NovelPaginationConfiguration,
+        discardingLayout: Bool = false
     ) {
-        let currentFontSize = overrideFontSize ?? self.fontSize
-        let currentFontFamily = overrideFontFamily ?? self.fontFamily
-        let currentLineSpacing = overrideLineSpacing ?? self.lineSpacing
-        let currentTheme = overrideTheme ?? self.theme
-        AppLogger.ui.debug("[NovelPagingReaderView] Starting pagination with size: \(String(describing: size))")
-        guard size.width > 0 && size.height > 0 else {
-            AppLogger.ui.debug("[NovelPagingReaderView] Invalid size, aborting pagination.")
+        guard configuration.containerSize.width > 0,
+              configuration.containerSize.height > 0 else { return }
+        if discardingLayout {
+            paginatedCache.removeAll()
+        }
+        let chapters = loadedChapters
+        let missing = chapters
+            .filter { paginatedCache[$0.id] == nil }
+            .map { NovelPaginationChapter(id: $0.id, chapter: $0.chapter, pages: $0.pages) }
+        paginationGeneration += 1
+        let generation = paginationGeneration
+        paginationTask?.cancel()
+        layoutTask?.cancel()
+        guard !missing.isEmpty else {
+            showPages(of: chapters)
             return
         }
-
-        let usableSize = CGSize(width: size.width - 32, height: size.height - 80)
-        AppLogger.ui.debug("[NovelPagingReaderView] Usable text container size: \(String(describing: usableSize))")
-        let configuration = NovelPaginationConfiguration(
-            containerSize: size,
-            fontSize: currentFontSize,
-            fontFamily: currentFontFamily,
-            lineSpacing: currentLineSpacing,
-            textColor: UIColor(currentTheme.textColor)
-        )
-
-        for loadedChapter in loadedChapters {
-            guard paginatedCache[loadedChapter.id] == nil else { continue }
-            AppLogger.ui.debug("[NovelPagingReaderView] Paginating new chapter: \(loadedChapter.chapter.title ?? loadedChapter.chapter.key)")
-            guard let pages = NovelPaginationEngine.paginate(
-                chapters: [NovelPaginationChapter(
-                    id: loadedChapter.id,
-                    chapter: loadedChapter.chapter,
-                    pages: loadedChapter.pages
-                )],
-                configuration: configuration
-            ) else {
-                return
-            }
-            paginatedCache[loadedChapter.id] = pages.map(\.string)
+        let layout = Task.detached(priority: .userInitiated) {
+            NovelPaginationEngine.paginate(chapters: missing, configuration: configuration)
         }
-
-        // Rebuild flattened array preserving order of loadedChapters
-        var newFlattened: [PagedItem] = []
-        for loadedChapter in loadedChapters {
-            if let extracted = paginatedCache[loadedChapter.id] {
-                for str in extracted {
-                    newFlattened.append(PagedItem(chapter: loadedChapter.chapter, string: str))
-                }
+        layoutTask = layout
+        paginationTask = Task { @MainActor in
+            let pages = await layout.value
+            guard generation == paginationGeneration, let pages else { return }
+            let byChapter = Dictionary(grouping: pages, by: \.chapterID)
+            for chapter in missing {
+                paginatedCache[chapter.id] = byChapter[chapter.id] ?? []
             }
+            showPages(of: chapters)
         }
+    }
 
-        AppLogger.ui.debug("[NovelPagingReaderView] Pagination complete. Total pages: \(newFlattened.count)")
+    /// Shows the laid-out pages of `chapters`, opening at the pending restore place if any,
+    /// otherwise at the text the reader was on before.
+    private func showPages(of chapters: [NovelLoadedChapter]) {
+        let place = flattenedPages.indices.contains(currentPageIndex)
+            ? NovelReadingAnchor(
+                chapterID: flattenedPages[currentPageIndex].chapterID,
+                offset: flattenedPages[currentPageIndex].startOffset
+            )
+            : nil
+        let loadedIDs = Set(chapters.map(\.id))
+        paginatedCache = paginatedCache.filter { loadedIDs.contains($0.key) }
+        let pages = chapters.flatMap { paginatedCache[$0.id] ?? [] }
 
-        self.flattenedPages = newFlattened
-        self.currentPageIndex = min(currentPageIndex, max(0, newFlattened.count - 1))
+        let newIndex: Int
+        if let restoreAnchor, let index = Self.pageIndex(for: restoreAnchor, in: pages) {
+            newIndex = index
+            onRestoreAnchorApplied(restoreAnchor)
+        } else if let place, let index = Self.pageIndex(for: place, in: pages) {
+            newIndex = index
+        } else {
+            newIndex = min(currentPageIndex, max(0, pages.count - 1))
+        }
+        flattenedPages = pages
+        currentPageIndex = newIndex
+        reportPosition(of: pages, at: newIndex)
+        // Opening or restoring near the end loads the next chapter, as a swipe there would.
+        if prefetchChapters && newIndex >= pages.count - 3 {
+            onLoadNextChapter()
+        }
+    }
+
+    /// "3/12": the page's place within its own chapter, as the manga reader counts.
+    static func chapterPageLabel(of pages: [NovelPaginationPage], at index: Int) -> String {
+        guard pages.indices.contains(index) else { return "" }
+        let chapterID = pages[index].chapterID
+        let chapterPages = pages.indices.filter { pages[$0].chapterID == chapterID }
+        let position = (chapterPages.firstIndex(of: index) ?? 0) + 1
+        return "\(position)/\(chapterPages.count)"
+    }
+
+    /// The page in the anchor's chapter that contains its offset.
+    static func pageIndex(for anchor: NovelReadingAnchor, in pages: [NovelPaginationPage]) -> Int? {
+        pages.indices.last { index in
+            pages[index].chapterID == anchor.chapterID && pages[index].startOffset <= anchor.offset
+        } ?? pages.firstIndex { $0.chapterID == anchor.chapterID }
+    }
+
+    private func reportPosition(of pages: [NovelPaginationPage], at index: Int) {
+        guard pages.indices.contains(index) else { return }
+        let page = pages[index]
+        onPositionChanged(page.chapterID, page.startOffset, page.isLastInChapter)
     }
 }
 
 // MARK: - UIPageViewController Wrapper
 
 struct PageViewController: UIViewControllerRepresentable {
-    let pages: [NSAttributedString]
+    let pages: [NovelPaginationPage]
     @Binding var currentPage: Int
     let maxWidth: CGFloat
+    /// For image pages' loading and error content.
+    let textColor: Color
     let onPageChanged: (Int) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -192,7 +268,7 @@ struct PageViewController: UIViewControllerRepresentable {
         pvc.delegate = context.coordinator
         pvc.view.backgroundColor = .clear
 
-        if let firstVC = context.coordinator.makePageContentVC(index: 0) {
+        if let firstVC = context.coordinator.makePageContentVC(index: currentPage) {
             pvc.setViewControllers([firstVC], direction: .forward, animated: false)
         }
 
@@ -202,43 +278,50 @@ struct PageViewController: UIViewControllerRepresentable {
     func updateUIViewController(_ pvc: UIPageViewController, context: Context) {
         let coordinator = context.coordinator
         let oldPages = coordinator.parent.pages
-
-        AppLogger.ui.debug("[PageViewController] updateUIViewController called. oldPages count: \(oldPages.count), new pages count: \(pages.count)")
-
-        // Update the coordinator's reference to the latest data
         coordinator.parent = self
 
-        // Check if pages content actually changed (not just a re-render)
-        let contentChanged = oldPages.count != pages.count ||
-            zip(oldPages, pages).contains(where: { $0.0 !== $0.1 })
-
-        if contentChanged {
-            AppLogger.ui.debug("[PageViewController] Content changed, refreshing. Setting vc for index \(currentPage)")
-            let targetIndex = min(currentPage, max(0, pages.count - 1))
-            if let vc = coordinator.makePageContentVC(index: targetIndex) {
-                pvc.setViewControllers([vc], direction: .forward, animated: false)
-            } else {
-                AppLogger.ui.debug("[PageViewController] Failed to create VC for index \(targetIndex)")
-            }
+        // Pages added after the existing ones are served by the data source, except when the
+        // last page is showing: the page controller may already have been told there is no
+        // next page, so the shown page is set again. Changed pages, or a different current
+        // page, also need the shown page replaced.
+        let existingChanged = pages.count < oldPages.count
+            || zip(oldPages, pages).contains(where: { $0.0.string !== $0.1.string })
+        let shownIndex = (pvc.viewControllers?.first as? PageContentViewController)?.index
+        let appendedAfterShownLastPage = pages.count > oldPages.count
+            && shownIndex == oldPages.count - 1
+        guard existingChanged || appendedAfterShownLastPage || shownIndex != currentPage else { return }
+        if coordinator.isTransitioning {
+            // Replacing pages in the middle of a swipe confuses the page controller.
+            coordinator.needsRefresh = true
         } else {
-            AppLogger.ui.debug("[PageViewController] Content did not change.")
+            coordinator.showPage(in: pvc, at: currentPage)
         }
     }
 
     class Coordinator: NSObject, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
         var parent: PageViewController
+        var isTransitioning = false
+        var needsRefresh = false
 
         init(_ parent: PageViewController) {
             self.parent = parent
+        }
+
+        func showPage(in pvc: UIPageViewController, at index: Int) {
+            needsRefresh = false
+            let target = min(index, max(0, parent.pages.count - 1))
+            if let vc = makePageContentVC(index: target) {
+                pvc.setViewControllers([vc], direction: .forward, animated: false)
+            }
         }
 
         func makePageContentVC(index: Int) -> PageContentViewController? {
             guard index >= 0 && index < parent.pages.count else { return nil }
             let vc = PageContentViewController()
             vc.index = index
-            vc.attributedString = parent.pages[index]
+            vc.page = parent.pages[index]
             vc.maxWidth = parent.maxWidth
-            AppLogger.ui.debug("[PageViewController Coordinator] Created VC for index \(index) with string length \(vc.attributedString?.length ?? 0)")
+            vc.foreground = parent.textColor
             return vc
         }
 
@@ -255,29 +338,56 @@ struct PageViewController: UIViewControllerRepresentable {
         }
 
         func pageViewController(_ pageViewController: UIPageViewController,
+                                willTransitionTo pendingViewControllers: [UIViewController]) {
+            isTransitioning = true
+        }
+
+        func pageViewController(_ pageViewController: UIPageViewController,
                                 didFinishAnimating finished: Bool,
                                 previousViewControllers: [UIViewController],
                                 transitionCompleted completed: Bool) {
+            isTransitioning = false
+            var shown = parent.currentPage
             if completed,
                let vc = pageViewController.viewControllers?.first as? PageContentViewController {
-                parent.currentPage = vc.index
-                parent.onPageChanged(vc.index)
+                // After a relayout during the swipe, the page swiped to belongs to the old
+                // layout: find its text in the new one instead of trusting its old index.
+                shown = needsRefresh ? index(ofTextOn: vc) : vc.index
+                parent.currentPage = shown
+                parent.onPageChanged(shown)
             }
+            if needsRefresh {
+                showPage(in: pageViewController, at: shown)
+            }
+        }
+
+        private func index(ofTextOn vc: PageContentViewController) -> Int {
+            guard let page = vc.page,
+                  let index = NovelPagingReaderView.pageIndex(
+                      for: NovelReadingAnchor(chapterID: page.chapterID, offset: page.startOffset),
+                      in: parent.pages
+                  ) else { return min(vc.index, max(0, parent.pages.count - 1)) }
+            return index
         }
     }
 }
 
 class PageContentViewController: UIViewController {
     var index: Int = 0
-    var attributedString: NSAttributedString?
+    var page: NovelPaginationPage?
     var maxWidth: CGFloat = 0
+    var foreground: Color = .primary
 
     private let textView = UITextView()
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        AppLogger.ui.debug("[PageContentViewController] viewDidLoad for index \(self.index)")
         view.backgroundColor = .clear
+
+        if let image = page?.image {
+            showImage(image)
+            return
+        }
 
         textView.isEditable = false
         textView.isSelectable = true
@@ -297,8 +407,7 @@ class PageContentViewController: UIViewController {
             textView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20)
         ])
 
-        textView.attributedText = attributedString
-        AppLogger.ui.debug("[PageContentViewController] set attributedText for index \(self.index)")
+        textView.attributedText = page?.string
 
         // Disable UITextView's built-in double tap to remove selection conflicts,
         // users can still long-press to select text.
@@ -307,6 +416,24 @@ class PageContentViewController: UIViewController {
                 tapRecognizer.isEnabled = false
             }
         }
+    }
+
+    /// An illustration fills the page, loaded the same way as in continuous mode.
+    private func showImage(_ image: NovelPageImage) {
+        let host = UIHostingController(
+            rootView: MangaImage(urlStr: image.url, headers: image.headers, foreground: foreground)
+        )
+        host.view.backgroundColor = .clear
+        host.view.translatesAutoresizingMaskIntoConstraints = false
+        addChild(host)
+        view.addSubview(host.view)
+        NSLayoutConstraint.activate([
+            host.view.topAnchor.constraint(equalTo: view.topAnchor, constant: 20),
+            host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20)
+        ])
+        host.didMove(toParent: self)
     }
 }
 
@@ -333,6 +460,10 @@ struct BatteryIndicator: View {
             UIDevice.current.isBatteryMonitoringEnabled = true
             level = UIDevice.current.batteryLevel
             state = UIDevice.current.batteryState
+        }
+        .onDisappear {
+            // Monitoring costs power and nothing else in the app reads the battery.
+            UIDevice.current.isBatteryMonitoringEnabled = false
         }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.batteryLevelDidChangeNotification)) { _ in
             level = UIDevice.current.batteryLevel

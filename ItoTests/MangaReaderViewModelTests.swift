@@ -4,7 +4,7 @@ import ito_runner
 
 @MainActor
 final class MangaReaderViewModelTests: XCTestCase {
-    func testInitialPagedLoadSortsPublishesThenRunsHistoryProgressTracker() async {
+    func testInitialPagedLoadSortsPublishesAndMarksReadOnlyAtTheLastPage() async {
         let chapter = makeChapter("a", number: 12.75)
         let subject = makeSubject(chapters: [chapter])
         subject.loader.enqueue(
@@ -14,7 +14,6 @@ final class MangaReaderViewModelTests: XCTestCase {
 
         subject.viewModel.start()
         await waitForReader { subject.viewModel.loadPhase == .content }
-        await waitForReader { subject.tracker.requests.count == 1 }
 
         XCTAssertEqual(subject.loader.requestedChapterKeys, ["a"])
         XCTAssertEqual(subject.viewModel.pagedPages.map(\.index), [2, 5, 8])
@@ -23,6 +22,13 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.history.requests[0].chapterTitle, "a")
         XCTAssertEqual(subject.history.requests[0].pluginID, "plugin.test")
         XCTAssertEqual(subject.history.requests[0].manga.key, "manga")
+        XCTAssertTrue(subject.progress.requests.isEmpty)
+        XCTAssertFalse(subject.viewModel.markedChapterKeys.contains("a"))
+
+        subject.viewModel.setPagedIndex(1)
+        subject.viewModel.setPagedIndex(2)
+        await waitForReader { subject.tracker.requests.count == 1 }
+
         XCTAssertEqual(subject.progress.requests.map(\.chapterID), ["a"])
         XCTAssertEqual(subject.tracker.requests.map(\.progress), [12])
         XCTAssertEqual(
@@ -30,6 +36,51 @@ final class MangaReaderViewModelTests: XCTestCase {
             ["history:a", "progress:a", "tracker:12"]
         )
         XCTAssertTrue(subject.viewModel.markedChapterKeys.contains("a"))
+    }
+
+    func testPagedChapterOpensAtTheSavedPageAndSavesNewPages() async {
+        let chapter = makeChapter("a", number: 3)
+        let subject = makeSubject(chapters: [chapter])
+        subject.progress.savedPages["a"] = 2
+        subject.loader.enqueue(.pages([page(0), page(1), page(2), page(3)]), for: "a")
+
+        subject.viewModel.start()
+        await waitForReader { subject.viewModel.loadPhase == .content }
+        XCTAssertEqual(subject.viewModel.pagedIndex, 2)
+
+        subject.viewModel.setPagedIndex(1)
+        await waitForReader { subject.progress.savedPageWrites.count == 2 }
+        XCTAssertEqual(subject.progress.savedPageWrites.map(\.page), [2, 1])
+        XCTAssertTrue(subject.progress.requests.isEmpty)
+    }
+
+    func testFinishedChapterStartsOverInsteadOfReopeningAtTheLastPage() async {
+        let chapter = makeChapter("a", number: 3)
+        let subject = makeSubject(chapters: [chapter], viewer: .Vertical)
+        subject.progress.savedPages["a"] = 2
+        subject.loader.enqueue(.pages([page(0), page(1), page(2)]), for: "a")
+
+        subject.viewModel.start()
+        await waitForReader { subject.viewModel.loadPhase == .content }
+
+        XCTAssertEqual(subject.viewModel.continuousPageIndex, 0)
+        XCTAssertNil(subject.viewModel.scrollTarget)
+    }
+
+    func testContinuousChapterOpensAtTheSavedPage() async {
+        let chapter = makeChapter("a", number: 3)
+        let subject = makeSubject(chapters: [chapter], viewer: .Vertical)
+        subject.progress.savedPages["a"] = 1
+        subject.loader.enqueue(.pages([page(0), page(1), page(2)]), for: "a")
+
+        subject.viewModel.start()
+        await waitForReader { subject.viewModel.loadPhase == .content }
+
+        XCTAssertEqual(subject.viewModel.continuousPageIndex, 1)
+        XCTAssertEqual(
+            subject.viewModel.scrollTarget,
+            MangaScrollRequest(pageID: "a#1", animated: false)
+        )
     }
 
     func testInitialContinuousLoadPublishesSingleSortedSegment() async {
@@ -60,9 +111,10 @@ final class MangaReaderViewModelTests: XCTestCase {
         await waitForReader { subject.viewModel.loadPhase == .content }
     }
 
-    func testInitialFailurePublishesEquivalentInlineFailure() async {
+    func testInitialFailurePublishesInlineFailureAndRetryLoadsAgain() async {
         let subject = makeSubject(chapters: [makeChapter("a", number: 1)])
         subject.loader.enqueue(.failure(MangaReaderTestError.expected), for: "a")
+        subject.loader.enqueue(.pages([page(0), page(1)]), for: "a")
 
         subject.viewModel.start()
         await waitForReader {
@@ -71,6 +123,11 @@ final class MangaReaderViewModelTests: XCTestCase {
 
         XCTAssertTrue(subject.viewModel.pagedPages.isEmpty)
         XCTAssertTrue(subject.history.requests.isEmpty)
+
+        subject.viewModel.retry()
+        await waitForReader { subject.viewModel.loadPhase == .content }
+        XCTAssertEqual(subject.viewModel.pagedPages.count, 2)
+        XCTAssertEqual(subject.loader.callCount(for: "a"), 2)
     }
 
     func testStaleInitialCompletionCannotReplaceDirectNavigation() async {
@@ -314,6 +371,34 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.viewModel.currentChapter.key, "b")
     }
 
+    func testSwipingBackOpensThePreviousChapterAtItsLastPage() async {
+        let a = makeChapter("a", number: 1)
+        let b = makeChapter("b", number: 2)
+        let c = makeChapter("c", number: 3)
+        let subject = makeSubject(chapters: [a, b, c], initial: c)
+        subject.loader.enqueue(.pages([page(0)]), for: "c")
+        subject.loader.enqueue(.suspended, for: "b")
+        subject.loader.enqueue(.pages([page(0), page(1), page(2)]), for: "b")
+        subject.loader.enqueue(.pages([page(0), page(1)]), for: "a")
+        subject.viewModel.start()
+        await waitForReader { subject.loader.pendingCount(for: "b") == 1 }
+
+        // Not cached yet: opens at the end once loaded.
+        subject.viewModel.setPagedIndex(-1)
+        await waitForReader {
+            subject.viewModel.currentChapter.key == "b"
+                && subject.viewModel.loadPhase == .content
+        }
+        XCTAssertEqual(subject.viewModel.pagedIndex, 2)
+
+        // Cached: opens at the end straight away.
+        await waitForReader { subject.viewModel.prefetchedChapters["a"] != nil }
+        subject.viewModel.setPagedIndex(-1)
+        XCTAssertEqual(subject.viewModel.currentChapter.key, "a")
+        XCTAssertEqual(subject.viewModel.pagedIndex, 1)
+        subject.loader.resolveFirst(for: "b", with: .success([]))
+    }
+
     func testContinuousAppendSortsSuppressesDuplicatesAndDoesNotChangeCurrentChapter() async {
         let a = makeChapter("a", number: 1)
         let b = makeChapter("b", number: 2)
@@ -337,7 +422,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.history.requests.map(\.chapterKey), ["a"])
     }
 
-    func testContinuousAppendFailureCleansOnlyItsOperationAndAllowsRetry() async {
+    func testContinuousAppendFailureWaitsForAnExplicitRetry() async {
         let a = makeChapter("a", number: 1)
         let b = makeChapter("b", number: 2)
         let subject = makeSubject(chapters: [a, b], initial: a, viewer: .Vertical)
@@ -350,8 +435,16 @@ final class MangaReaderViewModelTests: XCTestCase {
         subject.viewModel.appendNextChapter()
         await waitForReader { !subject.viewModel.loadingNextChapter }
         XCTAssertEqual(subject.viewModel.segments.count, 1)
+        XCTAssertTrue(subject.viewModel.appendFailed)
+
+        // The end of the list coming back into view does not retry by itself.
         subject.viewModel.appendNextChapter()
+        XCTAssertFalse(subject.viewModel.loadingNextChapter)
+        XCTAssertEqual(subject.loader.callCount(for: "b"), 1)
+
+        subject.viewModel.retryAppendNextChapter()
         await waitForReader { subject.viewModel.segments.count == 2 }
+        XCTAssertFalse(subject.viewModel.appendFailed)
         XCTAssertEqual(subject.loader.callCount(for: "b"), 2)
     }
 
@@ -395,7 +488,42 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.viewModel.segments.map { $0.chapter.key }, ["a", "b"])
         XCTAssertEqual(subject.viewModel.segments[0].pages.map(\.index), [2, 5])
         XCTAssertEqual(subject.viewModel.continuousPageIndex, 3)
-        XCTAssertEqual(subject.viewModel.scrollTarget, 3)
+        XCTAssertEqual(
+            subject.viewModel.scrollTarget,
+            MangaScrollRequest(pageID: "b#1", animated: false)
+        )
+    }
+
+    func testContinuousDropsChaptersFarBehindTheReader() async {
+        let chapters = (1...5).map { makeChapter("c\($0)", number: Float($0)) }
+        let subject = makeSubject(chapters: chapters, initial: chapters[0], viewer: .Vertical)
+        for chapter in chapters {
+            subject.loader.enqueue(.pages([page(0), page(1)]), for: chapter.key)
+        }
+        subject.viewModel.start()
+        await waitForReader { subject.viewModel.loadPhase == .content }
+
+        for loaded in 1..<5 {
+            // Scroll to the end of the newest chapter, then load the next one.
+            let last = subject.viewModel.flatPages.last!
+            subject.viewModel.continuousPageAppeared(last)
+            for passed in subject.viewModel.flatPages where passed.id != last.id {
+                subject.viewModel.continuousPageDisappeared(passed)
+            }
+            subject.viewModel.appendNextChapter()
+            await waitForReader { subject.viewModel.flatPages.last?.chapter.key == "c\(loaded + 1)" }
+        }
+
+        XCTAssertEqual(
+            subject.viewModel.segments.map { $0.chapter.key },
+            ["c2", "c3", "c4", "c5"]
+        )
+        // The reader stays on the same page after the chapter above it is dropped.
+        XCTAssertEqual(subject.viewModel.flatPages[subject.viewModel.continuousPageIndex].id, "c4#1")
+        XCTAssertEqual(
+            subject.viewModel.scrollTarget,
+            MangaScrollRequest(pageID: "c4#1", animated: false)
+        )
     }
 
     func testContinuousPrependFailureCleansOperationAndAllowsRetry() async {
@@ -438,7 +566,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTAssertFalse(subject.viewModel.loadingPrevChapter)
     }
 
-    func testVisibleContinuousChapterTransitionMarksThenPrefetches() async {
+    func testVisibleContinuousChapterTransitionOpensThenPrefetches() async {
         let a = makeChapter("a", number: 1)
         let b = makeChapter("b", number: 2)
         let subject = makeSubject(
@@ -458,16 +586,24 @@ final class MangaReaderViewModelTests: XCTestCase {
         )
         subject.viewModel.start()
         await waitForReader { subject.viewModel.loadPhase == .content }
+        // A one-page chapter is finished as soon as it is shown.
+        await waitForReader { subject.progress.requests.count == 1 }
         subject.viewModel.appendNextChapter()
         await waitForReader { subject.viewModel.segments.count == 2 }
 
         let firstB = subject.viewModel.flatPages.first { $0.chapter.key == "b" }!
         subject.viewModel.continuousPageAppeared(firstB)
-        await waitForReader { subject.progress.requests.count == 2 }
+        await yieldReaderTasks()
 
         XCTAssertEqual(subject.viewModel.currentChapter.key, "b")
         XCTAssertEqual(subject.history.requests.map(\.chapterKey), ["a", "b"])
+        XCTAssertEqual(subject.progress.requests.map(\.chapterID), ["a"])
         XCTAssertEqual(subject.imagePrefetcher.batches.last?.map(\.index), [1, 2])
+
+        let lastB = subject.viewModel.flatPages.last { $0.chapter.key == "b" }!
+        subject.viewModel.continuousPageAppeared(lastB)
+        await waitForReader { subject.progress.requests.count == 2 }
+        XCTAssertEqual(subject.progress.requests.map(\.chapterID), ["a", "b"])
     }
 
     func testViewerPrecedenceAndModeClassification() {
@@ -502,7 +638,7 @@ final class MangaReaderViewModelTests: XCTestCase {
 
         XCTAssertTrue(subject.viewModel.isPaged)
         XCTAssertEqual(subject.viewModel.pagedPages.map(\.index), [4, 9])
-        XCTAssertEqual(subject.viewModel.pagedIndex, 9)
+        XCTAssertEqual(subject.viewModel.pagedIndex, 1)
     }
 
     func testContinuousToPagedProjectionDoesNotStartAdjacentRunnerWork() async {
@@ -521,7 +657,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTAssertTrue(subject.viewModel.prefetchedChapters.isEmpty)
     }
 
-    func testContinuousToPagedMismatchedFlatPageFallsBackToFirstPageIndex() {
+    func testContinuousToPagedMismatchedFlatPageFallsBackToFirstPage() {
         let current = makeChapter("a", number: 1)
         let other = makeChapter("b", number: 2)
         let currentPages = [page(4), page(9)]
@@ -541,10 +677,10 @@ final class MangaReaderViewModelTests: XCTestCase {
         )
 
         XCTAssertEqual(projection?.pages.map(\.index), [4, 9])
-        XCTAssertEqual(projection?.index, 4)
+        XCTAssertEqual(projection?.index, 0)
     }
 
-    func testContinuousToPagedOutOfRangeFallsBackToFirstPageIndex() {
+    func testContinuousToPagedOutOfRangeFallsBackToFirstPage() {
         let current = makeChapter("a", number: 1)
         let currentPages = [page(4), page(9)]
         let projection = MangaReaderViewModel.pagedProjection(
@@ -555,7 +691,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         )
 
         XCTAssertEqual(projection?.pages.map(\.index), [4, 9])
-        XCTAssertEqual(projection?.index, 4)
+        XCTAssertEqual(projection?.index, 0)
     }
 
     func testContinuousToPagedMissingSegmentStartsPagedReload() async {
@@ -582,7 +718,10 @@ final class MangaReaderViewModelTests: XCTestCase {
         mapped.viewModel.setPagedIndex(1)
         mapped.viewModel.setViewerOverride(.Vertical)
         XCTAssertEqual(mapped.viewModel.continuousPageIndex, 1)
-        XCTAssertEqual(mapped.viewModel.scrollTarget, 1)
+        XCTAssertEqual(
+            mapped.viewModel.scrollTarget,
+            MangaScrollRequest(pageID: "a#1", animated: false)
+        )
 
         let fallback = makeSubject(chapters: [makeChapter("a", number: 1)])
         fallback.loader.enqueue(.pages([page(2), page(4)]), for: "a")
@@ -590,7 +729,10 @@ final class MangaReaderViewModelTests: XCTestCase {
         await waitForReader { fallback.viewModel.loadPhase == .content }
         fallback.viewModel.setViewerOverride(.Vertical)
         XCTAssertEqual(fallback.viewModel.continuousPageIndex, 0)
-        XCTAssertEqual(fallback.viewModel.scrollTarget, 0)
+        XCTAssertEqual(
+            fallback.viewModel.scrollTarget,
+            MangaScrollRequest(pageID: "a#0", animated: false)
+        )
     }
 
     func testModeChangeWithoutAvailablePagesReloadsAndRejectsOldModeResult() async {
@@ -616,8 +758,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         let subject = makeSubject(chapters: [chapter])
         subject.progress.error = MangaReaderTestError.expected
 
-        subject.viewModel.markChapterRead(chapter)
-        XCTAssertEqual(subject.history.requests.map(\.chapterKey), ["a"])
+        subject.viewModel.markChapterFinished(chapter)
         XCTAssertTrue(subject.viewModel.markedChapterKeys.contains("a"))
         await waitForReader { subject.progress.requests.count == 1 }
 
@@ -625,16 +766,15 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.viewModel.loadPhase, .idle)
     }
 
-    func testRepeatedMarkStillRecordsHistoryAndSuppressesLocalAndTracker() async {
+    func testRepeatedFinishSuppressesLocalAndTracker() async {
         let chapter = makeChapter("a", number: 4)
         let subject = makeSubject(chapters: [chapter])
 
-        subject.viewModel.markChapterRead(chapter)
+        subject.viewModel.markChapterFinished(chapter)
         await waitForReader { subject.tracker.requests.count == 1 }
-        subject.viewModel.markChapterRead(chapter)
+        subject.viewModel.markChapterFinished(chapter)
         await yieldReaderTasks()
 
-        XCTAssertEqual(subject.history.requests.map(\.chapterKey), ["a", "a"])
         XCTAssertEqual(subject.progress.requests.count, 1)
         XCTAssertEqual(subject.tracker.requests.count, 1)
     }
@@ -643,7 +783,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         let chapter = makeChapter("a", number: nil, title: "Chapter 12.5 Extra")
         let subject = makeSubject(chapters: [chapter])
 
-        subject.viewModel.markChapterRead(chapter)
+        subject.viewModel.markChapterFinished(chapter)
         await waitForReader { subject.tracker.requests.count == 1 }
 
         XCTAssertNil(subject.progress.requests[0].chapterNumber)
@@ -661,7 +801,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         subject.viewModel.appear()
         let initial = subject.presence.presented[0]
         XCTAssertEqual(initial.details, "Manga")
-        XCTAssertEqual(initial.state, "Reading Chapter 1.0")
+        XCTAssertEqual(initial.state, "Reading Chapter 1")
         XCTAssertEqual(initial.activityType, 3)
         XCTAssertEqual(initial.detailsURL, "https://anilist.co/manga/123")
         XCTAssertEqual(initial.largeImageText, "Reading from Group at Plugin Name")
@@ -672,7 +812,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.presence.presented.last?.state, "Reading Second")
         XCTAssertEqual(subject.presence.presented.last?.resetTimer, false)
         let countAfterChange = subject.presence.presented.count
-        subject.viewModel.markChapterRead(b)
+        subject.viewModel.markChapterFinished(b)
         XCTAssertEqual(subject.presence.presented.count, countAfterChange)
         subject.viewModel.disappear()
         XCTAssertEqual(subject.presence.events.last, .clear)
@@ -709,9 +849,8 @@ final class MangaReaderViewModelTests: XCTestCase {
             for: "a"
         )
         subject.viewModel.start()
+        // Loading the chapter preloads ahead of the first page without waiting for a swipe.
         await waitForReader { subject.viewModel.loadPhase == .content }
-
-        subject.viewModel.setPagedIndex(0)
 
         XCTAssertEqual(subject.imagePrefetcher.batches.count, 1)
         XCTAssertEqual(subject.imagePrefetcher.batches[0].map(\.index), [2])
@@ -756,7 +895,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         )
         subject.viewModel.start()
         await waitForReader { subject.viewModel.loadPhase == .content }
-        subject.viewModel.setPagedIndex(0)
+        subject.viewModel.setPagedIndex(1)
         subject.viewModel.disappear()
 
         XCTAssertTrue(subject.imagePrefetcher.batches.isEmpty)
@@ -774,7 +913,7 @@ final class MangaReaderViewModelTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private func makeSubject(
+    func makeSubject(
         chapters: [Manga.Chapter],
         initial: Manga.Chapter? = nil,
         viewer: Manga.Viewer = .Default,
@@ -795,7 +934,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         )
     }
 
-    private func makeChapter(
+    func makeChapter(
         _ key: String,
         number: Float32?,
         title: String? = nil,
@@ -809,7 +948,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         )
     }
 
-    private func page(
+    func page(
         _ index: Int32,
         text: String? = nil,
         url: String? = nil,
@@ -825,7 +964,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         )
     }
 
-    private func waitForReader(
+    func waitForReader(
         _ condition: @escaping @MainActor () -> Bool
     ) async {
         for _ in 0..<10_000 {
@@ -835,7 +974,7 @@ final class MangaReaderViewModelTests: XCTestCase {
         XCTFail("Timed out waiting for deterministic Reader condition")
     }
 
-    private func yieldReaderTasks() async {
+    func yieldReaderTasks() async {
         for _ in 0..<20 { await Task.yield() }
     }
 }

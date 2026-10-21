@@ -4,6 +4,13 @@ import ito_runner
 
 @MainActor
 final class ReaderChapterOrderingTests: XCTestCase {
+    func testChapterTitlePrefersTitleThenNumberWithoutTrailingZero() {
+        XCTAssertEqual(ReaderChapterTitle.text(title: "Prologue", number: 3), "Prologue")
+        XCTAssertEqual(ReaderChapterTitle.text(title: "", number: 12), "Chapter 12")
+        XCTAssertEqual(ReaderChapterTitle.text(title: nil, number: 12.5), "Chapter 12.5")
+        XCTAssertEqual(ReaderChapterTitle.text(title: nil, number: nil), "Unknown Chapter")
+    }
+
     func testMangaNextAndPreviousUseClosestNumericChapterIndependentOfInputOrder() {
         let current = mangaChapter("current", number: 2, scanlator: "preferred")
         let one = mangaChapter("one", number: 1)
@@ -79,16 +86,27 @@ final class ReaderChapterOrderingTests: XCTestCase {
         XCTAssertEqual(mangaAfter(current, in: [current, second, first])?.key, "second")
     }
 
-    func testMangaNilNumberUsesSentinelBehaviorAndHasNoPreviousChapter() {
+    func testMangaUnnumberedChapterMovesByListPositionNewestFirst() {
+        let newer = mangaChapter("newer", number: nil)
         let current = mangaChapter("current", number: nil)
-        let chapters = [
-            mangaChapter("nil-peer", number: nil),
-            mangaChapter("two", number: 2),
-            mangaChapter("one", number: 1),
-            current
-        ]
-        XCTAssertEqual(mangaAfter(current, in: chapters)?.key, "one")
-        XCTAssertNil(mangaBefore(current, in: chapters))
+        let older = mangaChapter("older", number: nil)
+        let chapters = [newer, current, older]
+
+        XCTAssertEqual(mangaAfter(current, in: chapters)?.key, "newer")
+        XCTAssertEqual(mangaBefore(current, in: chapters)?.key, "older")
+        XCTAssertNil(mangaAfter(newer, in: chapters))
+        XCTAssertNil(mangaBefore(older, in: chapters))
+    }
+
+    func testMangaNumberedChapterSkipsUnnumberedExtras() {
+        let two = mangaChapter("two", number: 2)
+        let extra = mangaChapter("extra", number: nil)
+        let one = mangaChapter("one", number: 1)
+        let chapters = [two, extra, one]
+
+        XCTAssertNil(mangaBefore(one, in: chapters))
+        XCTAssertEqual(mangaAfter(one, in: chapters)?.key, "two")
+        XCTAssertNil(mangaAfter(two, in: chapters))
     }
 
     func testMangaMissingCurrentStillNavigatesNumericallyAndBoundariesReturnNil() {
@@ -128,41 +146,40 @@ final class ReaderChapterOrderingTests: XCTestCase {
         XCTAssertEqual(novelBefore(current, in: chapters)?.key, "previous-outside")
     }
 
-    func testNovelNilCurrentNumberFallsBackToDescendingArrayNeighbors() {
-        let previousInReadingOrder = novelChapter("next-number", number: nil)
+    func testNovelNilCurrentNumberUsesListPositionNewestFirst() {
+        let newer = novelChapter("newer", number: nil)
         let current = novelChapter("current", number: nil)
-        let nextInReadingOrder = novelChapter("previous-number", number: nil)
-        let chapters = [previousInReadingOrder, current, nextInReadingOrder]
+        let older = novelChapter("older", number: nil)
+        let chapters = [newer, current, older]
 
-        XCTAssertEqual(novelAfter(current, in: chapters)?.key, "next-number")
-        XCTAssertEqual(novelBefore(current, in: chapters)?.key, "previous-number")
+        XCTAssertEqual(novelAfter(current, in: chapters)?.key, "newer")
+        XCTAssertEqual(novelBefore(current, in: chapters)?.key, "older")
     }
 
-    func testNovelIndexFallbackUsesOppositeNeighborAtArrayBoundaries() {
+    func testNovelListEndsHaveNoNeighborInsteadOfTheOppositeOne() {
         let first = novelChapter("first", number: nil)
         let second = novelChapter("second", number: nil)
         let chapters = [first, second]
 
-        XCTAssertEqual(novelAfter(first, in: chapters)?.key, "second")
-        XCTAssertEqual(novelBefore(first, in: chapters)?.key, "second")
+        XCTAssertNil(novelAfter(first, in: chapters))
+        XCTAssertNil(novelBefore(second, in: chapters))
     }
 
-    func testNovelNumericBoundariesFallBackToOnlyArrayNeighbor() {
+    func testNovelLatestAndFirstNumberedChaptersHaveNoNextOrPrevious() {
+        // Newest first, as plugins list them: the latest chapter must not lead back to the one
+        // before it, which made Seamless Reading alternate between the two.
         let one = novelChapter("one", number: 1)
         let two = novelChapter("two", number: 2)
-        let chapters = [one, two]
+        let chapters = [two, one]
 
-        XCTAssertEqual(novelAfter(two, in: chapters)?.key, "one")
-        XCTAssertEqual(novelBefore(one, in: chapters)?.key, "two")
+        XCTAssertNil(novelAfter(two, in: chapters))
+        XCTAssertNil(novelBefore(one, in: chapters))
     }
 
-    func testNovelNumericPreviousCanSelectNilNumberSentinelBeforeIndexFallback() {
+    func testNovelNumberedChapterSkipsUnnumberedExtras() {
         let nilNumber = novelChapter("nil-number", number: nil)
         let current = novelChapter("current", number: 1)
-        XCTAssertEqual(
-            novelBefore(current, in: [current, nilNumber])?.key,
-            "nil-number"
-        )
+        XCTAssertNil(novelBefore(current, in: [current, nilNumber]))
     }
 
     func testNovelMissingKeyReturnsNilOnlyWhenNumericSelectionCannotResolve() {

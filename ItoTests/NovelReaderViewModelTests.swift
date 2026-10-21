@@ -4,7 +4,7 @@ import ito_runner
 
 @MainActor
 final class NovelReaderViewModelTests: XCTestCase {
-    func testInitialLoadSortsPublishesThenRunsHistoryProgressTracker() async {
+    func testInitialLoadRecordsHistoryAndMarksReadOnlyAtTheEnd() async {
         let chapter = makeChapter("a", number: 12.75)
         let subject = makeSubject(chapters: [chapter], initial: chapter)
         subject.loader.enqueue(
@@ -26,11 +26,61 @@ final class NovelReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.viewModel.loadedChapters[0].pages.map(\.index), [2, 5, 8])
         XCTAssertEqual(phaseAtHistory, .content)
         XCTAssertEqual(chapterCountAtHistory, 1)
-        XCTAssertEqual(subject.events.events, ["history:a", "progress:a", "tracker:12"])
+        XCTAssertEqual(subject.events.events, ["history:a"])
         XCTAssertEqual(subject.history.requests[0].chapterTitle, "a")
         XCTAssertEqual(subject.history.requests[0].pluginID, "plugin.test")
+
+        let loaded = subject.viewModel.loadedChapters[0]
+        subject.viewModel.continuousPageAppeared(chapterID: loaded.id, pageIndex: 2)
+        await subject.viewModel.waitForAllOperationsForTesting()
+        XCTAssertEqual(subject.events.events, ["history:a"])
+
+        subject.viewModel.continuousChapterEndAppeared(chapterID: loaded.id)
+        await subject.viewModel.waitForAllOperationsForTesting()
+        XCTAssertEqual(subject.events.events, ["history:a", "progress:a", "tracker:12"])
         XCTAssertEqual(subject.progress.requests[0].media, mediaIdentity)
         XCTAssertEqual(subject.progress.requests[0].chapterNumber, 12.75)
+    }
+
+    func testChapterOpensAtTheSavedOffsetAndSavesNewOffsets() async {
+        let chapter = makeChapter("a", number: 1)
+        let subject = makeSubject(chapters: [chapter], initial: chapter)
+        // Blocks of 10, 20 and 5 characters plus separators start at 0, 12 and 34.
+        subject.loader.enqueue(
+            .pages([
+                page(0, text: String(repeating: "a", count: 10)),
+                page(1, text: String(repeating: "b", count: 20)),
+                page(2, text: String(repeating: "c", count: 5))
+            ]),
+            for: "a"
+        )
+        subject.progress.savedOffsets["a"] = 20
+
+        subject.viewModel.start()
+        await subject.viewModel.waitForAllOperationsForTesting()
+
+        let loaded = subject.viewModel.loadedChapters[0]
+        XCTAssertEqual(subject.viewModel.restoreAnchor, NovelReadingAnchor(chapterID: loaded.id, offset: 20))
+        XCTAssertEqual(NovelTextOffsets.blockIndex(containing: 20, in: loaded.pages), 1)
+        subject.viewModel.consumeRestoreAnchor(NovelReadingAnchor(chapterID: loaded.id, offset: 20))
+        XCTAssertNil(subject.viewModel.restoreAnchor)
+
+        subject.viewModel.continuousPageAppeared(chapterID: loaded.id, pageIndex: 2)
+        await subject.viewModel.waitForAllOperationsForTesting()
+        XCTAssertEqual(subject.progress.savedOffsetWrites.map(\.offset), [34])
+        XCTAssertTrue(subject.progress.requests.isEmpty)
+    }
+
+    func testFinishedChapterStartsOverInsteadOfRestoringItsEnd() async {
+        let chapter = makeChapter("a", number: 1)
+        let subject = makeSubject(chapters: [chapter], initial: chapter)
+        subject.loader.enqueue(.pages([page(0, text: "abc")]), for: "a")
+        subject.progress.savedOffsets["a"] = 5
+
+        subject.viewModel.start()
+        await subject.viewModel.waitForAllOperationsForTesting()
+
+        XCTAssertNil(subject.viewModel.restoreAnchor)
     }
 
     func testInitialFailureAndRetryReplaceFailureWithOneChapter() async {
@@ -100,25 +150,6 @@ final class NovelReaderViewModelTests: XCTestCase {
         }
     }
 
-    func testNavigationUsesPR12NumericAndAsymmetricFallbackOrdering() {
-        let one = makeChapter("one", number: 1)
-        let two = makeChapter("two", number: 2)
-        let three = makeChapter("three", number: 3)
-        let numeric = makeSubject(chapters: [three, one, two], initial: two)
-        XCTAssertEqual(numeric.viewModel.nextChapter?.key, "three")
-        XCTAssertEqual(numeric.viewModel.previousChapter?.key, "one")
-
-        let first = makeChapter("first", number: nil)
-        let middle = makeChapter("middle", number: nil)
-        let last = makeChapter("last", number: nil)
-        let fallback = makeSubject(chapters: [first, middle, last], initial: middle)
-        XCTAssertEqual(fallback.viewModel.nextChapter?.key, "first")
-        XCTAssertEqual(fallback.viewModel.previousChapter?.key, "last")
-
-        let boundary = makeSubject(chapters: [one, two], initial: two)
-        XCTAssertEqual(boundary.viewModel.nextChapter?.key, "one")
-    }
-
     func testDirectNavigationMutatesPresenceAndClearsChainBeforeLoadThenTracksAfterSuccess() async {
         let a = makeChapter("a", number: 1, title: "A")
         let b = makeChapter("b", number: 2, title: "B")
@@ -142,6 +173,45 @@ final class NovelReaderViewModelTests: XCTestCase {
         subject.loader.resolveFirst(for: "b", with: .success([page(7)]))
         await subject.viewModel.waitForAllOperationsForTesting()
         XCTAssertEqual(subject.history.requests.map(\.chapterKey), ["a", "b"])
+    }
+
+    func testSwitchingModesReopensAtTheSamePlace() async {
+        let a = makeChapter("a", number: 1)
+        let subject = makeSubject(chapters: [a], initial: a)
+        subject.loader.enqueue(.pages([page(1), page(2), page(3)]), for: "a")
+        subject.viewModel.start()
+        await subject.viewModel.waitForAllOperationsForTesting()
+        let chapter = subject.viewModel.loadedChapters[0]
+        let third = NovelTextOffsets.blockStarts(chapter.pages)[2]
+
+        subject.viewModel.continuousPageAppeared(chapterID: chapter.id, pageIndex: 2)
+        subject.viewModel.setIsPaging(true)
+        XCTAssertEqual(subject.viewModel.restoreAnchor, NovelReadingAnchor(chapterID: chapter.id, offset: third))
+
+        // The scroll view leaving the screen while paging does not move the place.
+        subject.viewModel.continuousPageDisappeared(chapterID: chapter.id, pageIndex: 2)
+        subject.viewModel.continuousPageAppeared(chapterID: chapter.id, pageIndex: 0)
+        await subject.viewModel.waitForAllOperationsForTesting()
+        XCTAssertEqual(subject.progress.savedOffsets["a"], third)
+    }
+
+    func testFinishedChapterStaysFinishedWhileItsEndIsOnScreen() async {
+        let a = makeChapter("a", number: 1)
+        let subject = makeSubject(chapters: [a], initial: a)
+        subject.loader.enqueue(.pages([page(1), page(2)]), for: "a")
+        subject.viewModel.start()
+        await subject.viewModel.waitForAllOperationsForTesting()
+        let chapter = subject.viewModel.loadedChapters[0]
+        let end = NovelTextOffsets.bodyLength(chapter.pages)
+
+        subject.viewModel.continuousPageAppeared(chapterID: chapter.id, pageIndex: 1)
+        subject.viewModel.continuousChapterEndAppeared(chapterID: chapter.id)
+        // Scrolling into the space below the end pushes the last paragraph off the top.
+        subject.viewModel.continuousPageDisappeared(chapterID: chapter.id, pageIndex: 1)
+        subject.viewModel.continuousPageAppeared(chapterID: chapter.id, pageIndex: 1)
+        await subject.viewModel.waitForAllOperationsForTesting()
+
+        XCTAssertEqual(subject.progress.savedOffsets["a"], end)
     }
 
     func testDirectNavigationReloadsAlreadyAppendedChapterInsteadOfReusingIt() async {
@@ -320,7 +390,23 @@ final class NovelReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.viewModel.loadedChapters.count, 1)
     }
 
-    func testAppendFailureKeepsContentAndAllowsLaterRetry() async {
+    func testAppendOnTheNewestChapterDoesNotLoadTheOneBeforeIt() async {
+        let a = makeChapter("a", number: 1)
+        let b = makeChapter("b", number: 2)
+        // Plugins list chapters newest first.
+        let subject = makeSubject(chapters: [b, a], initial: b)
+        subject.loader.enqueue(.pages([page(1)]), for: "b")
+        subject.viewModel.start()
+        await subject.viewModel.waitForAllOperationsForTesting()
+
+        XCTAssertNil(subject.viewModel.chapterAfter(b))
+        subject.viewModel.loadNextChapter()
+
+        XCTAssertEqual(subject.loader.requests.map { $0.chapter.key }, ["b"])
+        XCTAssertEqual(subject.viewModel.loadedChapters.map { $0.chapter.key }, ["b"])
+    }
+
+    func testAppendFailureKeepsContentAndWaitsForAnExplicitRetry() async {
         let a = makeChapter("a", number: 1)
         let b = makeChapter("b", number: 2)
         let subject = makeSubject(chapters: [a, b], initial: a)
@@ -335,11 +421,41 @@ final class NovelReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.viewModel.loadPhase, .content)
         XCTAssertEqual(subject.viewModel.loadedChapters.map { $0.chapter.key }, ["a"])
         XCTAssertFalse(subject.viewModel.isLoadingNext)
+        XCTAssertTrue(subject.viewModel.appendFailed)
 
+        // Scrolling to the end or turning pages again does not retry by itself.
         subject.viewModel.loadNextChapter()
+        XCTAssertEqual(subject.loader.callCount(for: "b"), 1)
+
+        subject.viewModel.retryNextChapter()
         await subject.viewModel.waitForAllOperationsForTesting()
         XCTAssertEqual(subject.loader.callCount(for: "b"), 2)
+        XCTAssertFalse(subject.viewModel.appendFailed)
         XCTAssertEqual(subject.viewModel.loadedChapters.map { $0.chapter.key }, ["a", "b"])
+    }
+
+    func testScrollingBackUpIntoAnEarlierChapterMakesItCurrent() async {
+        let a = makeChapter("a", number: 1)
+        let b = makeChapter("b", number: 2)
+        let subject = makeSubject(chapters: [a, b], initial: a)
+        subject.loader.enqueue(.pages([page(1), page(2)]), for: "a")
+        subject.loader.enqueue(.pages([page(1), page(2)]), for: "b")
+        subject.viewModel.start()
+        await subject.viewModel.waitForAllOperationsForTesting()
+        subject.viewModel.loadNextChapter()
+        await subject.viewModel.waitForAllOperationsForTesting()
+        let chapterA = subject.viewModel.loadedChapters[0]
+        let chapterB = subject.viewModel.loadedChapters[1]
+
+        // Read down into b: a's text leaves the screen, b's heading and text are on it.
+        subject.viewModel.continuousPageAppeared(chapterID: chapterA.id, pageIndex: 1)
+        subject.viewModel.continuousChapterTitleAppeared(chapterB)
+        subject.viewModel.continuousPageDisappeared(chapterID: chapterA.id, pageIndex: 1)
+        XCTAssertEqual(subject.viewModel.currentChapter.key, "b")
+
+        // Scroll back up until only a's last paragraph and b's heading are on screen.
+        subject.viewModel.continuousPageAppeared(chapterID: chapterA.id, pageIndex: 1)
+        XCTAssertEqual(subject.viewModel.currentChapter.key, "a")
     }
 
     func testAppendStartedForOldChainCannotAppendAfterDirectNavigation() async {
@@ -448,7 +564,7 @@ final class NovelReaderViewModelTests: XCTestCase {
         await short.viewModel.waitForAllOperationsForTesting()
     }
 
-    func testContinuousTitleTransitionTracksButSameTitleDoesNot() async {
+    func testContinuousTitleTransitionRecordsHistoryOnce() async {
         let a = makeChapter("a", number: 1)
         let b = makeChapter("b", number: 2)
         let subject = await loadedTwoChapterSubject(a: a, b: b)
@@ -461,8 +577,7 @@ final class NovelReaderViewModelTests: XCTestCase {
 
         XCTAssertEqual(subject.viewModel.currentChapter.key, "b")
         XCTAssertEqual(subject.history.requests.count, baseline + 1)
-        XCTAssertEqual(subject.progress.requests.last?.chapterID, "b")
-        XCTAssertEqual(subject.tracker.requests.last?.progress, 2)
+        XCTAssertFalse(subject.progress.requests.contains { $0.chapterID == "b" })
         XCTAssertEqual(subject.presence.presented.last?.resetTimer, false)
 
         subject.viewModel.continuousChapterTitleAppeared(loadedB)
@@ -470,7 +585,7 @@ final class NovelReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.history.requests.count, baseline + 1)
     }
 
-    func testPagerTransitionChangesPresenceWithoutHistoryProgressOrTracker() async {
+    func testPagerTransitionRecordsHistoryWithoutProgressOrTracker() async {
         let a = makeChapter("a", number: 1)
         let b = makeChapter("b", number: 2)
         let subject = await loadedTwoChapterSubject(a: a, b: b)
@@ -484,7 +599,7 @@ final class NovelReaderViewModelTests: XCTestCase {
 
         XCTAssertEqual(subject.viewModel.currentChapter.key, "b")
         XCTAssertEqual(subject.presence.presented.last?.resetTimer, false)
-        XCTAssertEqual(subject.history.requests.count, historyCount)
+        XCTAssertEqual(subject.history.requests.count, historyCount + 1)
         XCTAssertEqual(subject.progress.requests.count, progressCount)
         XCTAssertEqual(subject.tracker.requests.count, trackerCount)
     }
@@ -497,6 +612,12 @@ final class NovelReaderViewModelTests: XCTestCase {
 
         subject.viewModel.start()
         await subject.viewModel.waitForAllOperationsForTesting()
+        subject.viewModel.readingPositionChanged(
+            chapterID: subject.viewModel.loadedChapters[0].id,
+            offset: 0,
+            reachedEnd: true
+        )
+        await subject.viewModel.waitForAllOperationsForTesting()
 
         XCTAssertEqual(subject.viewModel.loadPhase, .content)
         XCTAssertEqual(subject.history.requests.count, 1)
@@ -505,24 +626,23 @@ final class NovelReaderViewModelTests: XCTestCase {
         XCTAssertEqual(subject.events.events, ["history:a", "progress:a"])
     }
 
-    func testRepeatedNovelEffectsDoNotAdoptMangaSuppression() async {
+    func testRepeatedFinishInOneSessionMarksOnce() async {
         let chapter = makeChapter("a", number: 4)
         let subject = makeSubject(chapters: [chapter], initial: chapter)
 
-        subject.viewModel.markChapterRead(chapter)
-        subject.viewModel.markChapterRead(chapter)
+        subject.viewModel.markChapterFinished(chapter)
+        subject.viewModel.markChapterFinished(chapter)
         await subject.viewModel.waitForAllOperationsForTesting()
 
-        XCTAssertEqual(subject.history.requests.count, 2)
-        XCTAssertEqual(subject.progress.requests.count, 2)
-        XCTAssertEqual(subject.tracker.requests.map(\.progress), [4, 4])
+        XCTAssertEqual(subject.progress.requests.count, 1)
+        XCTAssertEqual(subject.tracker.requests.map(\.progress), [4])
     }
 
     func testNilChapterNumberUsesLeadingTitleNumberWithoutJoiningDecimals() async {
         let chapter = makeChapter("ignored", number: nil, title: "Chapter 12.5 Extra")
         let subject = makeSubject(chapters: [chapter], initial: chapter)
 
-        subject.viewModel.markChapterRead(chapter)
+        subject.viewModel.markChapterFinished(chapter)
         await subject.viewModel.waitForAllOperationsForTesting()
 
         XCTAssertNil(subject.progress.requests[0].chapterNumber)
@@ -568,13 +688,13 @@ final class NovelReaderViewModelTests: XCTestCase {
         XCTAssertTrue(subject.history.requests.isEmpty)
     }
 
-    func testFailedSettingWriteDoesNotOptimisticallyPublish() async {
+    func testFailedSettingWriteShowsTheChoiceThenPutsBackTheSavedValue() async {
         let chapter = makeChapter("a", number: 1)
         let subject = makeSubject(chapters: [chapter], initial: chapter)
         subject.settings.enqueue(.failure(NovelReaderTestError.expected), for: .fontSize)
 
         subject.viewModel.setFontSize(30)
-        XCTAssertEqual(subject.viewModel.fontSize, 18)
+        XCTAssertEqual(subject.viewModel.fontSize, 30)
         await subject.viewModel.waitForAllOperationsForTesting()
 
         XCTAssertEqual(subject.viewModel.fontSize, 18)
@@ -582,22 +702,36 @@ final class NovelReaderViewModelTests: XCTestCase {
         XCTAssertTrue(hasFinishedOutcome(.failed(.persistence), in: subject.logger.events))
     }
 
-    func testRapidSameSettingWritesSerializeAndConvergeToLatestAuthoritativeValue() async {
+    func testQuickSettingChangesBuildOnEachOtherAndSaveInOrder() async {
         let chapter = makeChapter("a", number: 1)
         let subject = makeSubject(chapters: [chapter], initial: chapter)
         subject.settings.enqueue(.suspended, for: .fontSize)
         subject.settings.enqueue(.success, for: .fontSize)
 
-        subject.viewModel.setFontSize(20)
-        subject.viewModel.setFontSize(26)
+        // Two A+ taps before the first save finishes: the second starts from the first.
+        subject.viewModel.setFontSize(subject.viewModel.fontSize + 2)
+        subject.viewModel.setFontSize(subject.viewModel.fontSize + 2)
+        XCTAssertEqual(subject.viewModel.fontSize, 22)
         await subject.settings.waitForPendingCount(1, for: .fontSize)
         XCTAssertEqual(subject.settings.writes, [.fontSize(20)])
-        XCTAssertEqual(subject.viewModel.fontSize, 18)
 
         subject.settings.resolveFirst(for: .fontSize)
         await subject.viewModel.waitForAllOperationsForTesting()
 
-        XCTAssertEqual(subject.settings.writes, [.fontSize(20), .fontSize(26)])
+        XCTAssertEqual(subject.settings.writes, [.fontSize(20), .fontSize(22)])
+        XCTAssertEqual(subject.viewModel.fontSize, 22)
+    }
+
+    func testFontSizeStaysWithinTheOfferedRange() async {
+        let chapter = makeChapter("a", number: 1)
+        let subject = makeSubject(chapters: [chapter], initial: chapter)
+
+        subject.viewModel.setFontSize(100)
+        XCTAssertEqual(subject.viewModel.fontSize, 40)
+        subject.viewModel.setFontSize(2)
+        XCTAssertEqual(subject.viewModel.fontSize, 10)
+        await subject.viewModel.waitForAllOperationsForTesting()
+        XCTAssertEqual(subject.settings.writes, [.fontSize(40), .fontSize(10)])
     }
 
     func testDisappearCancelsRetainedSettingWriteAndRejectsDismissedPresentationUpdate() async {
@@ -611,7 +745,6 @@ final class NovelReaderViewModelTests: XCTestCase {
         subject.settings.resolveFirst(for: .fontSize)
         await subject.viewModel.waitForAllOperationsForTesting()
 
-        XCTAssertEqual(subject.viewModel.fontSize, 18)
         let events = subject.logger.events.filter { $0.kind == .preferenceWrite }
         XCTAssertEqual(events.count, 2)
         XCTAssertEqual(events[0].phase, .started)
@@ -680,7 +813,7 @@ final class NovelReaderViewModelTests: XCTestCase {
         subject.viewModel.appear()
 
         let presence = subject.presence.presented.last
-        XCTAssertEqual(presence?.state, "Reading Chapter 3.0")
+        XCTAssertEqual(presence?.state, "Reading Chapter 3")
         XCTAssertNil(presence?.detailsURL)
         XCTAssertEqual(
             presence?.largeImageText,
@@ -716,6 +849,10 @@ final class NovelReaderViewModelTests: XCTestCase {
         subject.loader.enqueue(.pages([page(1)]), for: "a")
         subject.loader.enqueue(.suspended, for: "b")
         subject.viewModel.start()
+        await subject.viewModel.waitForAllOperationsForTesting()
+        subject.viewModel.continuousChapterEndAppeared(
+            chapterID: subject.viewModel.loadedChapters[0].id
+        )
         await subject.progress.waitForPendingCount(1)
         subject.viewModel.loadNextChapter()
         await subject.loader.waitForPendingCount(1, for: "b")

@@ -5,35 +5,6 @@ import ito_runner
 
 @MainActor
 final class NovelPaginationTests: XCTestCase {
-    func testExtractionKeepsEngineContractAndViewOwnedCacheClampAndRendering() throws {
-        let engine = try sourceFile("Ito/Views/Reader/NovelPaginationEngine.swift")
-        let view = try sourceFile("Ito/Views/Reader/NovelPagingReaderView.swift")
-
-        for required in [
-            "configuration.containerSize.width - 32",
-            "configuration.containerSize.height - 80",
-            "formattedTitle(for: chapter.chapter) + \"\\n\\n\"",
-            "string: text + \"\\n\\n\"",
-            "if case .text(let text) = page.content",
-            "container.lineFragmentPadding = 0",
-            "manager.characterRange(",
-            "if containers.count > 1000 || glyphRange.length == 0"
-        ] {
-            XCTAssertTrue(engine.contains(required), "Missing engine behavior: \(required)")
-        }
-
-        for required in [
-            "@State private var paginatedCache",
-            "@State private var flattenedPages",
-            "@State private var currentPageIndex",
-            "PageViewController(",
-            "NovelPaginationEngine.paginate(",
-            "min(currentPageIndex, max(0, newFlattened.count - 1))"
-        ] {
-            XCTAssertTrue(view.contains(required), "Missing View ownership: \(required)")
-        }
-    }
-
     func testInvalidContainerSizeReturnsNoPaginationResult() {
         let chapter = loadedChapter(key: "one", number: 1, body: "Body")
 
@@ -42,12 +13,52 @@ final class NovelPaginationTests: XCTestCase {
         XCTAssertNil(enginePaginate([chapter], size: CGSize(width: 0, height: 480)))
     }
 
-    func testShortChapterFormatsTitleAndBodyAndIgnoresURLPages() throws {
+    func testSamePlaceIsFoundAfterTheTextIsLaidOutAgainLarger() throws {
+        let words = (1...1200).map { "word\($0)" }.joined(separator: " ")
+        let chapter = loadedChapter(key: "long", number: 1, body: words)
+        let size = CGSize(width: 320, height: 520)
+        let small = try XCTUnwrap(enginePaginate([chapter], size: size, fontSize: 14))
+        let large = try XCTUnwrap(enginePaginate([chapter], size: size, fontSize: 24))
+        XCTAssertGreaterThan(large.count, small.count)
+
+        // Reading the middle of the chapter at the small size, then making the text larger.
+        let reading = small[small.count / 2]
+        let anchor = NovelReadingAnchor(chapterID: chapter.id, offset: reading.startOffset)
+        let index = try XCTUnwrap(NovelPagingReaderView.pageIndex(for: anchor, in: large))
+
+        // The page shown is the one whose text contains that place.
+        XCTAssertLessThanOrEqual(large[index].startOffset, reading.startOffset)
+        if large.indices.contains(index + 1) {
+            XCTAssertGreaterThan(large[index + 1].startOffset, reading.startOffset)
+        }
+    }
+
+    func testPageCounterCountsWithinTheChapter() throws {
+        let first = loadedChapter(key: "one", number: 1, body: String(repeating: "Alpha beta. ", count: 400))
+        let second = loadedChapter(key: "two", number: 2, body: String(repeating: "Gamma delta. ", count: 400))
+        let pages = try XCTUnwrap(enginePaginate([first, second], size: CGSize(width: 320, height: 480)))
+        let firstCount = pages.filter { $0.chapterID == first.id }.count
+        let secondCount = pages.count - firstCount
+        XCTAssertGreaterThan(firstCount, 1)
+
+        XCTAssertEqual(NovelPagingReaderView.chapterPageLabel(of: pages, at: 0), "1/\(firstCount)")
+        // The second chapter's first page starts counting again.
+        XCTAssertEqual(
+            NovelPagingReaderView.chapterPageLabel(of: pages, at: firstCount),
+            "1/\(secondCount)"
+        )
+    }
+
+    func testShortChapterKeepsImagesAsPagesAtTheirPlaceInTheText() throws {
         let loaded = NovelLoadedChapter(
             chapter: Novel.Chapter(key: "one", title: "Opening", chapter: 1),
             pages: [
                 Page(index: 0, content: .text("First paragraph.")),
-                Page(index: 1, content: .url("https://example.com/image")),
+                Page(
+                    index: 1,
+                    content: .url("https://example.com/image"),
+                    headers: ["Referer": "https://example.com"]
+                ),
                 Page(index: 2, content: .text("Second paragraph."))
             ]
         )
@@ -56,12 +67,24 @@ final class NovelPaginationTests: XCTestCase {
             enginePaginate([loaded], size: CGSize(width: 320, height: 480))
         )
 
-        XCTAssertEqual(pages.count, 1)
-        XCTAssertEqual(pages.map(\.chapter.key), ["one"])
+        XCTAssertEqual(pages.count, 3)
+        XCTAssertEqual(pages.map(\.string.string), [
+            "Chapter 1 - Opening\n\nFirst paragraph.\n\n",
+            "",
+            "Second paragraph.\n\n"
+        ])
         XCTAssertEqual(
-            pages.map(\.string.string).joined(),
-            "Chapter 1 - Opening\n\nFirst paragraph.\n\nSecond paragraph.\n\n"
+            pages[1].image,
+            NovelPageImage(url: "https://example.com/image", headers: ["Referer": "https://example.com"])
         )
+        // Offsets match the continuous reader's, and the image has its own: a place saved on it
+        // reopens on it, not on the text after it.
+        let starts = NovelTextOffsets.blockStarts(loaded.pages)
+        XCTAssertEqual(pages.map(\.startOffset), [starts[0], starts[1], starts[2]])
+        XCTAssertLessThan(starts[1], starts[2])
+        let onImage = NovelReadingAnchor(chapterID: loaded.id, offset: starts[1])
+        XCTAssertEqual(NovelPagingReaderView.pageIndex(for: onImage, in: pages), 1)
+        XCTAssertEqual(pages.map(\.isLastInChapter), [false, false, true])
     }
 
     func testLongChapterSpansPagesWithoutTextLossOrDuplication() throws {
@@ -504,14 +527,5 @@ final class NovelPaginationTests: XCTestCase {
             }.joined()
             return formattedTitle(loadedChapter.chapter) + "\n\n" + body
         }.joined()
-    }
-
-    private func sourceFile(_ relativePath: String) throws -> String {
-        let testsFile = URL(fileURLWithPath: #filePath)
-        let root = testsFile.deletingLastPathComponent().deletingLastPathComponent()
-        return try String(
-            contentsOf: root.appendingPathComponent(relativePath),
-            encoding: .utf8
-        )
     }
 }

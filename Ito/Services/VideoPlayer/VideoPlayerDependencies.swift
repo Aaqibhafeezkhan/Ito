@@ -61,8 +61,10 @@ protocol VideoPlaybackCoordinating: AnyObject {
     var surface: (any VideoPlaybackSurface)? { get }
 
     func prepare(video: Anime.Video) async -> (any VideoPlaybackPreparation)?
+    /// Starts playing `preparation`, from `startTime` seconds when given.
     func activate(
         _ preparation: any VideoPlaybackPreparation,
+        startTime: Double?,
         onTimeUpdate: @escaping @MainActor (Double, Double) -> Void
     ) -> Bool
     func play()
@@ -96,6 +98,10 @@ final class AVPlayerVideoPlaybackCoordinator: VideoPlaybackCoordinating {
     private var periodicObserverToken: Any?
     private var observerGeneration: UInt64 = 0
     private var timeUpdate: (@MainActor (Double, Double) -> Void)?
+    private var readyObservation: NSKeyValueObservation?
+    /// True from activation until the seek to the start time finishes: until then the player
+    /// reports 0:00, which must not reach (and be saved by) the caller.
+    private var isSeekingToStart = false
 
     func prepare(video: Anime.Video) async -> (any VideoPlaybackPreparation)? {
         guard let url = URL(string: video.url) else { return nil }
@@ -110,6 +116,7 @@ final class AVPlayerVideoPlaybackCoordinator: VideoPlaybackCoordinating {
 
     func activate(
         _ preparation: any VideoPlaybackPreparation,
+        startTime: Double?,
         onTimeUpdate: @escaping @MainActor (Double, Double) -> Void
     ) -> Bool {
         guard let preparation = preparation as? AVPlayerVideoPlaybackPreparation else {
@@ -117,6 +124,7 @@ final class AVPlayerVideoPlaybackCoordinator: VideoPlaybackCoordinating {
         }
 
         timeUpdate = onTimeUpdate
+        readyObservation = nil
         if let player {
             player.replaceCurrentItem(with: preparation.item)
         } else {
@@ -125,8 +133,35 @@ final class AVPlayerVideoPlaybackCoordinator: VideoPlaybackCoordinating {
             surface = AVPlayerVideoPlaybackSurface(player: player)
         }
         installPeriodicObserverIfNeeded()
-        player?.play()
+        if let startTime, startTime > 0 {
+            isSeekingToStart = true
+            playWhenReady(preparation.item, from: startTime)
+        } else {
+            isSeekingToStart = false
+            player?.play()
+        }
         return true
+    }
+
+    /// Seeks once the item can play, then starts playback; a seek before then may be dropped.
+    private func playWhenReady(_ item: AVPlayerItem, from startTime: Double) {
+        let target = CMTime(seconds: startTime, preferredTimescale: 600)
+        readyObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            guard item.status == .readyToPlay else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.player?.currentItem === item, self.readyObservation != nil else {
+                    return
+                }
+                self.readyObservation = nil
+                item.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        guard self?.player?.currentItem === item else { return }
+                        self?.isSeekingToStart = false
+                        self?.player?.play()
+                    }
+                }
+            }
+        }
     }
 
     func play() {
@@ -140,6 +175,7 @@ final class AVPlayerVideoPlaybackCoordinator: VideoPlaybackCoordinating {
     func shutdown() {
         player?.pause()
         timeUpdate = nil
+        readyObservation = nil
         observerGeneration &+= 1
         if let periodicObserverToken, let player {
             player.removeTimeObserver(periodicObserverToken)
@@ -159,6 +195,7 @@ final class AVPlayerVideoPlaybackCoordinator: VideoPlaybackCoordinating {
                 guard let self,
                       self.periodicObserverToken != nil,
                       self.observerGeneration == generation,
+                      !self.isSeekingToStart,
                       let timeUpdate = self.timeUpdate else { return }
                 let duration = self.player?.currentItem?.duration.seconds ?? .nan
                 timeUpdate(time.seconds, duration)
@@ -180,6 +217,9 @@ protocol VideoPlayerProgressTracking: AnyObject {
         episodeID: String,
         episodeNumber: Float?
     ) async throws
+    /// Seconds into `episodeID` where watching stopped, if it is the last episode watched.
+    func savedPlaybackTime(media: MediaIdentity, episodeID: String) -> Double?
+    func savePlaybackTime(_ seconds: Double, media: MediaIdentity, episodeID: String) async throws
 }
 
 extension ReadProgressManager: VideoPlayerProgressTracking {
@@ -193,6 +233,14 @@ extension ReadProgressManager: VideoPlayerProgressTracking {
             episodeId: episodeID,
             episodeNum: episodeNumber
         )
+    }
+
+    func savedPlaybackTime(media: MediaIdentity, episodeID: String) -> Double? {
+        savedPosition(media: media, chapterKey: episodeID)
+    }
+
+    func savePlaybackTime(_ seconds: Double, media: MediaIdentity, episodeID: String) async throws {
+        try await savePosition(media: media, chapterKey: episodeID, position: seconds)
     }
 }
 
@@ -347,6 +395,18 @@ private final class UnavailableVideoPlayerDependencies:
         _ = episodeNumber
     }
 
+    func savedPlaybackTime(media: MediaIdentity, episodeID: String) -> Double? {
+        _ = media
+        _ = episodeID
+        return nil
+    }
+
+    func savePlaybackTime(_ seconds: Double, media: MediaIdentity, episodeID: String) async throws {
+        _ = seconds
+        _ = media
+        _ = episodeID
+    }
+
     func recordAnime(
         _ anime: Anime,
         episodeKey: String,
@@ -397,9 +457,11 @@ private final class UnavailableVideoPlaybackCoordinator: VideoPlaybackCoordinati
 
     func activate(
         _ preparation: any VideoPlaybackPreparation,
+        startTime: Double?,
         onTimeUpdate: @escaping @MainActor (Double, Double) -> Void
     ) -> Bool {
         _ = preparation
+        _ = startTime
         _ = onTimeUpdate
         return false
     }

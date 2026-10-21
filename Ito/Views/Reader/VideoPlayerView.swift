@@ -11,8 +11,9 @@ struct VideoPlayerView: View {
 
     @Environment(\.dismiss) private var dismiss
 
-    init(viewModel: VideoPlayerViewModel) {
-        _viewModel = StateObject(wrappedValue: viewModel)
+    /// `viewModel` is evaluated once, when SwiftUI first creates this view's state.
+    init(viewModel: @autoclosure @escaping () -> VideoPlayerViewModel) {
+        _viewModel = StateObject(wrappedValue: viewModel())
     }
 
     var body: some View {
@@ -60,6 +61,27 @@ struct VideoPlayerView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
+        .alert(
+            "Continue Watching?",
+            isPresented: Binding(
+                get: { viewModel.resumeOffer != nil },
+                // Dismissed without an answer (Cancel, escape gesture, keyboard): nothing is
+                // playing and the player has no controls yet, so close it.
+                set: { isPresented in
+                    if !isPresented, viewModel.resumeOffer != nil { dismiss() }
+                }
+            )
+        ) {
+            Button("Continue from \(Self.formattedTime(viewModel.resumeOffer ?? 0))") {
+                viewModel.resolveResumeOffer(continueWatching: true)
+            }
+            Button("Start Over") {
+                viewModel.resolveResumeOffer(continueWatching: false)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("You stopped this episode at \(Self.formattedTime(viewModel.resumeOffer ?? 0)).")
+        }
         .task {
             viewModel.start()
         }
@@ -72,6 +94,17 @@ struct VideoPlayerView: View {
         .onDisappear {
             viewModel.disappear()
         }
+    }
+
+    /// "12:34", or "1:02:03" past an hour.
+    static func formattedTime(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded(.down))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, secs)
+            : String(format: "%d:%02d", minutes, secs)
     }
 
     private var loadingView: some View {
@@ -117,6 +150,9 @@ struct VideoPlayerView: View {
                 .ignoresSafeArea()
                 .overlay(subtitleOverlay)
                 .overlay(controlsOverlay(video: video))
+        } else if viewModel.resumeOffer != nil {
+            // Nothing plays until Continue or Start Over is chosen.
+            Color.clear
         } else {
             Text("No playable streams found.")
                 .foregroundColor(.white)

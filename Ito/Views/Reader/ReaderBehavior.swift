@@ -1,22 +1,33 @@
 import Foundation
 import ito_runner
 
+nonisolated enum ReaderChapterTitle {
+    /// The chapter's title, else "Chapter 12.5" from its number (whole numbers without ".0"),
+    /// else "Unknown Chapter".
+    static func text(title: String?, number: Float32?) -> String {
+        if let title, !title.isEmpty { return title }
+        if let number { return "Chapter \(number.formatted())" }
+        return "Unknown Chapter"
+    }
+}
+
 nonisolated enum ReaderChapterOrdering {
     static let chapterNumberEpsilon: Float32 = 0.0001
-    private static let missingChapterNumber: Float32 = -10000
 
+    /// The next chapter: the closest higher-numbered one, or for an unnumbered chapter the one
+    /// listed above it (lists are newest first). Nil at the end.
     static func mangaChapter(
         after chapter: Manga.Chapter,
         in chapters: [Manga.Chapter]?,
         preferredScanlator: String?
     ) -> Manga.Chapter? {
         guard let chapters else { return nil }
-        let currentNumber = chapter.chapter ?? missingChapterNumber
-        let candidates = chapters.filter {
-            ($0.chapter ?? missingChapterNumber) > currentNumber + chapterNumberEpsilon
+        guard let currentNumber = chapter.chapter else {
+            return listNeighbor(of: chapter.key, in: chapters, offset: -1, key: \.key)
         }
-        guard let nextNumber = candidates.map({
-            $0.chapter ?? missingChapterNumber
+        // Unnumbered chapters are left out: their place among numbered ones is unknown.
+        guard let nextNumber = chapters.compactMap(\.chapter).filter({
+            $0 > currentNumber + chapterNumberEpsilon
         }).min() else {
             return nil
         }
@@ -27,18 +38,18 @@ nonisolated enum ReaderChapterOrdering {
         )
     }
 
+    /// The previous chapter, mirroring `mangaChapter(after:)`.
     static func mangaChapter(
         before chapter: Manga.Chapter,
         in chapters: [Manga.Chapter]?,
         preferredScanlator: String?
     ) -> Manga.Chapter? {
         guard let chapters else { return nil }
-        let currentNumber = chapter.chapter ?? missingChapterNumber
-        let candidates = chapters.filter {
-            ($0.chapter ?? missingChapterNumber) < currentNumber - chapterNumberEpsilon
+        guard let currentNumber = chapter.chapter else {
+            return listNeighbor(of: chapter.key, in: chapters, offset: 1, key: \.key)
         }
-        guard let previousNumber = candidates.map({
-            $0.chapter ?? missingChapterNumber
+        guard let previousNumber = chapters.compactMap(\.chapter).filter({
+            $0 < currentNumber - chapterNumberEpsilon
         }).max() else {
             return nil
         }
@@ -49,66 +60,53 @@ nonisolated enum ReaderChapterOrdering {
         )
     }
 
+    /// The chapter `offset` places from `key` in the list, or nil past either end.
+    private static func listNeighbor<Chapter>(
+        of key: String,
+        in chapters: [Chapter],
+        offset: Int,
+        key chapterKey: (Chapter) -> String
+    ) -> Chapter? {
+        guard let index = chapters.firstIndex(where: { chapterKey($0) == key }) else { return nil }
+        let neighbor = index + offset
+        return chapters.indices.contains(neighbor) ? chapters[neighbor] : nil
+    }
+
+    /// The next chapter: the closest higher-numbered one, or for an unnumbered chapter the one
+    /// listed above it (lists are newest first). Nil at the end, never the chapter before.
     static func novelChapter(
         after chapter: Novel.Chapter,
         in chapters: [Novel.Chapter]?
     ) -> Novel.Chapter? {
         guard let chapters else { return nil }
-
-        if let currentNumber = chapter.chapter {
-            let candidates = chapters.filter {
-                ($0.chapter ?? missingChapterNumber) > currentNumber + chapterNumberEpsilon
-            }
-            if let next = candidates.min(by: {
-                ($0.chapter ?? missingChapterNumber) < ($1.chapter ?? missingChapterNumber)
-            }) {
-                return next
-            }
+        guard let currentNumber = chapter.chapter else {
+            return listNeighbor(of: chapter.key, in: chapters, offset: -1, key: \.key)
         }
-
-        guard let currentIndex = chapters.firstIndex(where: {
-            $0.key == chapter.key
-        }) else {
-            return nil
-        }
-        if currentIndex - 1 >= 0 {
-            return chapters[currentIndex - 1]
-        }
-        if currentIndex + 1 < chapters.count {
-            return chapters[currentIndex + 1]
-        }
-        return nil
+        return numbered(chapters)
+            .filter { $0.number > currentNumber + chapterNumberEpsilon }
+            .min { $0.number < $1.number }?
+            .chapter
     }
 
+    /// The previous chapter, mirroring `novelChapter(after:)`.
     static func novelChapter(
         before chapter: Novel.Chapter,
         in chapters: [Novel.Chapter]?
     ) -> Novel.Chapter? {
         guard let chapters else { return nil }
+        guard let currentNumber = chapter.chapter else {
+            return listNeighbor(of: chapter.key, in: chapters, offset: 1, key: \.key)
+        }
+        return numbered(chapters)
+            .filter { $0.number < currentNumber - chapterNumberEpsilon }
+            .max { $0.number < $1.number }?
+            .chapter
+    }
 
-        if let currentNumber = chapter.chapter {
-            let candidates = chapters.filter {
-                ($0.chapter ?? missingChapterNumber) < currentNumber - chapterNumberEpsilon
-            }
-            if let previous = candidates.max(by: {
-                ($0.chapter ?? missingChapterNumber) < ($1.chapter ?? missingChapterNumber)
-            }) {
-                return previous
-            }
-        }
-
-        guard let currentIndex = chapters.firstIndex(where: {
-            $0.key == chapter.key
-        }) else {
-            return nil
-        }
-        if currentIndex + 1 < chapters.count {
-            return chapters[currentIndex + 1]
-        }
-        if currentIndex - 1 >= 0 {
-            return chapters[currentIndex - 1]
-        }
-        return nil
+    private static func numbered(
+        _ chapters: [Novel.Chapter]
+    ) -> [(chapter: Novel.Chapter, number: Float32)] {
+        chapters.compactMap { chapter in chapter.chapter.map { (chapter, $0) } }
     }
 
     private static func preferredMangaSource(
@@ -117,7 +115,7 @@ nonisolated enum ReaderChapterOrdering {
         preferredScanlator: String?
     ) -> Manga.Chapter? {
         let sources = chapters.filter {
-            abs(($0.chapter ?? missingChapterNumber) - chapterNumber) < chapterNumberEpsilon
+            $0.chapter.map { abs($0 - chapterNumber) < chapterNumberEpsilon } ?? false
         }
         if let match = sources.first(where: {
             $0.scanlator == preferredScanlator
@@ -134,39 +132,33 @@ nonisolated enum ReaderPageOrdering {
     }
 }
 
+/// What finishing a chapter does: mark it read locally, then update trackers. Opening a
+/// chapter only records history; the reader does that itself.
 nonisolated struct ReaderSessionEffectPlan: Equatable, Sendable {
     enum Effect: Equatable, Sendable {
-        case recordHistory
         case markLocalProgress
         case updateTracker(progress: Int)
     }
 
-    let synchronousEffects: [Effect]
-    let asynchronousEffects: [Effect]
+    let effects: [Effect]
 
-    static func chapterRead(
+    static func chapterFinished(
         chapterNumber: Float32?,
         titleOrKey: String,
         alreadyMarked: Bool
     ) -> ReaderSessionEffectPlan {
         guard !alreadyMarked else {
-            return ReaderSessionEffectPlan(
-                synchronousEffects: [.recordHistory],
-                asynchronousEffects: []
-            )
+            return ReaderSessionEffectPlan(effects: [])
         }
 
-        var asynchronousEffects: [Effect] = [.markLocalProgress]
+        var effects: [Effect] = [.markLocalProgress]
         if let progress = trackerProgress(
             chapterNumber: chapterNumber,
             titleOrKey: titleOrKey
         ) {
-            asynchronousEffects.append(.updateTracker(progress: progress))
+            effects.append(.updateTracker(progress: progress))
         }
-        return ReaderSessionEffectPlan(
-            synchronousEffects: [.recordHistory],
-            asynchronousEffects: asynchronousEffects
-        )
+        return ReaderSessionEffectPlan(effects: effects)
     }
 
     private static func trackerProgress(
@@ -177,5 +169,40 @@ nonisolated struct ReaderSessionEffectPlan: Equatable, Sendable {
             return Int(chapterNumber)
         }
         return TrackerProgressParser.number(inTitle: titleOrKey)
+    }
+}
+
+/// Positions inside a novel chapter, as UTF-16 offsets into its body text: each text block
+/// followed by the two-character separator the paginator puts between blocks, and one unit
+/// for each image. The same offsets work in the paged and continuous readers and survive
+/// repagination.
+nonisolated enum NovelTextOffsets {
+    static let blockSeparator = "\n\n"
+
+    static func blockStarts(_ pages: [Page]) -> [Int] {
+        var starts: [Int] = []
+        starts.reserveCapacity(pages.count)
+        var offset = 0
+        for page in pages {
+            starts.append(offset)
+            offset += length(of: page)
+        }
+        return starts
+    }
+
+    static func bodyLength(_ pages: [Page]) -> Int {
+        pages.reduce(0) { $0 + length(of: $1) }
+    }
+
+    /// The block that contains `offset`, or the last block before it.
+    static func blockIndex(containing offset: Int, in pages: [Page]) -> Int {
+        let starts = blockStarts(pages)
+        return starts.lastIndex { $0 <= offset } ?? 0
+    }
+
+    private static func length(of page: Page) -> Int {
+        // An image takes one unit, so a position can point at it rather than the text after it.
+        guard case .text(let text) = page.content else { return 1 }
+        return (text as NSString).length + (blockSeparator as NSString).length
     }
 }

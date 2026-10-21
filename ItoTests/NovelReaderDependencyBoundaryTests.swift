@@ -38,7 +38,6 @@ final class NovelReaderDependencyBoundaryTests: XCTestCase {
 
         XCTAssertEqual(view.components(separatedBy: "@StateObject").count - 1, 1)
         XCTAssertTrue(view.contains("@StateObject private var viewModel: NovelReaderViewModel"))
-        XCTAssertTrue(view.contains("StateObject(wrappedValue: viewModel)"))
         XCTAssertTrue(view.contains("GeometryReader"))
         XCTAssertTrue(view.contains("ScrollView"))
         XCTAssertTrue(view.contains("LazyVStack"))
@@ -169,9 +168,6 @@ final class NovelReaderDependencyBoundaryTests: XCTestCase {
 
         XCTAssertTrue(viewModel.contains("ReaderChapterOrdering.novelChapter("))
         XCTAssertTrue(viewModel.contains("ReaderPageOrdering.ascending("))
-        XCTAssertTrue(viewModel.contains("ReaderSessionEffectPlan.chapterRead("))
-        XCTAssertTrue(viewModel.contains("alreadyMarked: false"))
-        XCTAssertFalse(viewModel.contains("markedChapterKeys"))
         XCTAssertFalse(viewModel.contains("chapterNumberEpsilon"))
         XCTAssertFalse(viewModel.contains("missingChapterNumber"))
         XCTAssertTrue(behavior.contains("static let chapterNumberEpsilon: Float32 = 0.0001"))

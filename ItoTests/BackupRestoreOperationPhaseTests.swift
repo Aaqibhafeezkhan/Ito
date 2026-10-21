@@ -488,6 +488,35 @@ struct BackupRestoreOperationPhaseTests {
         #expect(categories.first?.name == "Uncategorized")
     }
 
+    @Test func restoreKeepsTheSavedReadingPositionAndMode() async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let backup = ImportedBackup(
+            metadata: BackupMetadataRecord(formatVersion: 1, createdAt: Date(timeIntervalSince1970: 1)),
+            capabilities: [capability(.readProgressAndResume, .representedNonempty)],
+            mediaReadProgress: [
+                MediaReadProgressRecord(
+                    pluginId: "plugin",
+                    canonicalMediaId: "series",
+                    lastReadChapterKey: "chapter-4",
+                    updatedAt: Date(timeIntervalSince1970: 2),
+                    provenance: .runtime,
+                    lastReadPosition: 17,
+                    readerViewer: 4
+                )
+            ]
+        )
+
+        _ = try await operation(database).restore(backup, mode: .wipe, operationId: "position")
+
+        let restored = try await database.dbPool.read { db in
+            try MediaReadProgressRecord.fetchOne(db)
+        }
+        #expect(restored?.lastReadChapterKey == "chapter-4")
+        #expect(restored?.lastReadPosition == 17)
+        #expect(restored?.readerViewer == 4)
+    }
+
     @Test func restoredSeriesWithoutAListAreFiledIntoUncategorized() async throws {
         let database = try TestDatabase()
         defer { database.cleanup() }

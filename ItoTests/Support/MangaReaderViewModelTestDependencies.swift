@@ -88,6 +88,11 @@ final class MangaReaderProgressFake: MangaReaderProgressTracking {
     let events: MangaReaderEventRecorder
     var error: (any Error)?
     private(set) var requests: [Request] = []
+    /// Pages the reader starts at, keyed by chapter.
+    var savedPages: [String: Int] = [:]
+    private(set) var savedPageWrites: [(chapterID: String, page: Int)] = []
+    var savedViewer: Manga.Viewer?
+    private(set) var savedViewerWrites: [Manga.Viewer] = []
 
     init(events: MangaReaderEventRecorder) {
         self.events = events
@@ -107,6 +112,29 @@ final class MangaReaderProgressFake: MangaReaderProgressTracking {
             )
         )
         if let error { throw error }
+    }
+
+    func savedPage(media: MediaIdentity, chapterID: String) -> Int? {
+        _ = media
+        return savedPages[chapterID]
+    }
+
+    func savePage(_ page: Int, media: MediaIdentity, chapterID: String) async throws {
+        _ = media
+        savedPageWrites.append((chapterID, page))
+        savedPages[chapterID] = page
+    }
+
+    func savedViewer(media: MediaIdentity) -> Manga.Viewer? {
+        _ = media
+        return savedViewer
+    }
+
+    func saveViewer(_ viewer: Manga.Viewer, media: MediaIdentity, chapterID: String) async throws {
+        _ = media
+        _ = chapterID
+        savedViewerWrites.append(viewer)
+        savedViewer = viewer
     }
 }
 
@@ -247,6 +275,7 @@ struct MangaReaderTestSubject {
     let metadata: MangaReaderPluginMetadataFake
     let imagePrefetcher: MangaReaderImagePrefetcherFake
     let logger: PresentationEventCaptureSpy
+    let dependencies: PreparedMangaReaderDependencies
 }
 
 @MainActor
@@ -293,6 +322,7 @@ func makeMangaReaderSubject(
         presence: presence,
         metadata: metadata,
         imagePrefetcher: imagePrefetcher,
-        logger: logger
+        logger: logger,
+        dependencies: dependencies
     )
 }

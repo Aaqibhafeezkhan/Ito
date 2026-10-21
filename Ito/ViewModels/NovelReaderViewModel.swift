@@ -25,6 +25,20 @@ struct NovelLoadedChapter: Identifiable, Equatable {
     }
 }
 
+/// A place to reopen a loaded chapter at; `offset` is a `NovelTextOffsets` offset.
+struct NovelReadingAnchor: Equatable {
+    let chapterID: UUID
+    let offset: Int
+}
+
+/// A block of a loaded chapter in continuous mode, by index into its pages; the chapter's
+/// heading comes before them all.
+struct NovelBlockReference: Hashable {
+    static let titleIndex = -1
+    let chapterID: UUID
+    let index: Int
+}
+
 @MainActor
 final class NovelReaderViewModel: ObservableObject {
     let pluginID: String
@@ -32,9 +46,20 @@ final class NovelReaderViewModel: ObservableObject {
     let chapterLoader: any NovelChapterLoading
 
     @Published private(set) var currentChapter: Novel.Chapter
-    @Published private(set) var loadedChapters: [NovelLoadedChapter] = []
+    @Published private(set) var loadedChapters: [NovelLoadedChapter] = [] {
+        didSet {
+            let ids = Set(loadedChapters.map(\.id))
+            visibleBlocks = visibleBlocks.filter { ids.contains($0.chapterID) }
+            visibleChapterEnds.formIntersection(ids)
+        }
+    }
     @Published private(set) var loadPhase: NovelReaderLoadPhase = .idle
     @Published private(set) var isLoadingNext = false
+    /// The last next-chapter load failed; it waits for `retryNextChapter` instead of being
+    /// started again by scrolling or page turns.
+    @Published private(set) var appendFailed = false
+    /// Where the reader should open the loaded chapter; the view applies it once and consumes it.
+    @Published private(set) var restoreAnchor: NovelReadingAnchor?
 
     @Published private(set) var fontSize: Double
     @Published private(set) var lineSpacing: Double
@@ -56,6 +81,17 @@ final class NovelReaderViewModel: ObservableObject {
     private var appendTask: Task<Void, Never>?
     private var appendOperationID: UUID?
     private var effectTasks: [UUID: Task<Void, Never>] = [:]
+    private var finishedChapterKeys: Set<String> = []
+    /// Continuous-mode blocks on screen; the topmost one is where the reader is.
+    private var visibleBlocks: Set<NovelBlockReference> = []
+    /// The last place reported in either mode, reopened after switching between them.
+    private var lastPosition: NovelReadingAnchor?
+    /// Chapters whose end marker is on screen: the reader is at their end.
+    private var visibleChapterEnds: Set<UUID> = []
+    private var historyChapterKeys: Set<String> = []
+    /// Offset writes run one after another so an older write cannot land after a newer one.
+    private var offsetWriteTask: Task<Void, Never>?
+    private var lastSavedOffset: (chapterKey: String, offset: Int)?
     private var settingsWriteTasks: [UUID: Task<Void, Never>] = [:]
     private var settingsWriteTailTasks: [NovelReaderSettingKind: Task<Void, Never>] = [:]
     private var settingsWriteOperationIDs: [NovelReaderSettingKind: UUID] = [:]
@@ -142,8 +178,10 @@ final class NovelReaderViewModel: ObservableObject {
         contentGeneration &+= 1
         cancelContentOperations(finishingAs: .cancelled)
 
-        for (operationID, task) in effectTasks {
-            task.cancel()
+        // The local read mark is durable progress and must finish even if the reader closes
+        // right after the end, so effect tasks are not cancelled; their tracker step checks
+        // that this presentation is still current.
+        for operationID in effectTasks.keys {
             logFinishedOnce(
                 kind: .chapterEffects,
                 operationID: operationID,
@@ -189,6 +227,7 @@ final class NovelReaderViewModel: ObservableObject {
         guard isActive else { return }
         changeCurrentChapter(to: chapter)
         loadedChapters = []
+        restoreAnchor = nil
         loadPhase = .loading
         invalidateContentOperations()
         beginMainLoad(for: chapter)
@@ -197,20 +236,57 @@ final class NovelReaderViewModel: ObservableObject {
     func retry() {
         guard isActive, case .failure = loadPhase else { return }
         loadedChapters = []
+        restoreAnchor = nil
         loadPhase = .loading
         invalidateContentOperations()
         beginMainLoad(for: currentChapter)
     }
 
     func continuousChapterTitleAppeared(_ loadedChapter: NovelLoadedChapter) {
-        guard isActive,
+        guard isActive, !isPaging,
               loadedChapters.contains(where: {
                   $0.id == loadedChapter.id
                       && NovelChapterToken($0.chapter) == NovelChapterToken(loadedChapter.chapter)
-              }),
-              currentChapter.key != loadedChapter.chapter.key else { return }
-        changeCurrentChapter(to: loadedChapter.chapter)
-        markChapterRead(loadedChapter.chapter)
+              }) else { return }
+        visibleBlocks.insert(
+            NovelBlockReference(chapterID: loadedChapter.id, index: NovelBlockReference.titleIndex)
+        )
+        updateContinuousPosition()
+    }
+
+    func continuousChapterTitleDisappeared(_ loadedChapter: NovelLoadedChapter) {
+        guard isActive, !isPaging,
+              visibleBlocks.remove(
+                  NovelBlockReference(chapterID: loadedChapter.id, index: NovelBlockReference.titleIndex)
+              ) != nil
+        else { return }
+        updateContinuousPosition()
+    }
+
+    /// Makes the chapter of the topmost visible block current and saves that place. Scrolling
+    /// up into an earlier chapter moves back to it, not only reaching a chapter's title.
+    private func updateContinuousPosition() {
+        let ranked = visibleBlocks.compactMap { block -> (rank: Int, block: NovelBlockReference)? in
+            guard let position = loadedChapters.firstIndex(where: { $0.id == block.chapterID }) else {
+                return nil
+            }
+            return (position, block)
+        }
+        guard let top = ranked.min(by: {
+            ($0.rank, $0.block.index) < ($1.rank, $1.block.index)
+        }) else { return }
+        let loaded = loadedChapters[top.rank]
+        if loaded.chapter.key != currentChapter.key {
+            changeCurrentChapter(to: loaded.chapter)
+            chapterOpened(loaded.chapter)
+        }
+        // While the chapter's end is still on screen the reader is at its end, even once the
+        // paragraph above has scrolled off the top; saving that paragraph would undo "finished".
+        let reachedEnd = visibleChapterEnds.contains(loaded.id)
+        let offset = top.block.index == NovelBlockReference.titleIndex
+            ? 0
+            : NovelTextOffsets.blockStarts(loaded.pages)[top.block.index]
+        readingPositionChanged(chapterID: loaded.id, offset: offset, reachedEnd: reachedEnd)
     }
 
     func pagedChapterChanged(_ chapter: Novel.Chapter) {
@@ -220,6 +296,26 @@ final class NovelReaderViewModel: ObservableObject {
               }),
               currentChapter.key != chapter.key else { return }
         changeCurrentChapter(to: chapter)
+        chapterOpened(chapter)
+    }
+
+    /// The reader moved to `offset` in a loaded chapter. Saves it, and marks the chapter read
+    /// when the end was reached.
+    func readingPositionChanged(chapterID: UUID, offset: Int, reachedEnd: Bool) {
+        guard isActive,
+              let loaded = loadedChapters.first(where: { $0.id == chapterID }) else { return }
+        let bodyLength = NovelTextOffsets.bodyLength(loaded.pages)
+        let position = reachedEnd ? bodyLength : min(offset, bodyLength)
+        lastPosition = NovelReadingAnchor(chapterID: chapterID, offset: position)
+        saveOffset(position, in: loaded.chapter)
+        if reachedEnd {
+            markChapterFinished(loaded.chapter)
+        }
+    }
+
+    func consumeRestoreAnchor(_ anchor: NovelReadingAnchor) {
+        guard restoreAnchor == anchor else { return }
+        restoreAnchor = nil
     }
 
     private func changeCurrentChapter(to chapter: Novel.Chapter) {
@@ -297,15 +393,26 @@ final class NovelReaderViewModel: ObservableObject {
             return
         }
 
-        loadedChapters = [NovelLoadedChapter(
+        let loaded = NovelLoadedChapter(
             chapter: chapter,
             pages: ReaderPageOrdering.ascending(pages)
-        )]
+        )
+        loadedChapters = [loaded]
+        restoreAnchor = savedAnchor(for: loaded)
         loadPhase = .content
         mainLoadTask = nil
         mainLoadOperationID = nil
         logFinishedOnce(kind: .remoteLoad, operationID: operationID, outcome: .succeeded)
-        markChapterRead(chapter)
+        chapterOpened(chapter)
+    }
+
+    /// Where the reader stopped in `loaded` last time, unless it was finished.
+    private func savedAnchor(for loaded: NovelLoadedChapter) -> NovelReadingAnchor? {
+        guard let saved = dependencies.progress.savedNovelOffset(
+            media: mediaIdentity,
+            chapterID: loaded.chapter.key
+        ), saved > 0, saved < NovelTextOffsets.bodyLength(loaded.pages) else { return nil }
+        return NovelReadingAnchor(chapterID: loaded.id, offset: saved)
     }
 
     private func failMainLoad(
@@ -354,12 +461,40 @@ final class NovelReaderViewModel: ObservableObject {
     // MARK: - Next-chapter append and automatic prefetch
 
     func continuousPageAppeared(chapterID: UUID, pageIndex: Int) {
-        guard isActive,
-              prefetchChapters,
+        guard isActive, !isPaging,
+              let loaded = loadedChapters.first(where: { $0.id == chapterID }),
+              loaded.pages.indices.contains(pageIndex) else { return }
+        visibleBlocks.insert(NovelBlockReference(chapterID: chapterID, index: pageIndex))
+        updateContinuousPosition()
+        guard prefetchChapters,
               let last = loadedChapters.last,
               last.id == chapterID,
-              last.pages.indices.contains(pageIndex),
               pageIndex >= last.pages.count - 5 else { return }
+        loadNextChapter()
+    }
+
+    func continuousPageDisappeared(chapterID: UUID, pageIndex: Int) {
+        guard isActive, !isPaging,
+              visibleBlocks.remove(NovelBlockReference(chapterID: chapterID, index: pageIndex)) != nil
+        else { return }
+        updateContinuousPosition()
+    }
+
+    /// The marker after a chapter's last block scrolled into view: the chapter was read to the end.
+    func continuousChapterEndAppeared(chapterID: UUID) {
+        guard !isPaging else { return }
+        visibleChapterEnds.insert(chapterID)
+        readingPositionChanged(chapterID: chapterID, offset: .max, reachedEnd: true)
+    }
+
+    func continuousChapterEndDisappeared(chapterID: UUID) {
+        visibleChapterEnds.remove(chapterID)
+    }
+
+    /// Loads the next chapter again after `appendFailed`.
+    func retryNextChapter() {
+        guard appendFailed else { return }
+        appendFailed = false
         loadNextChapter()
     }
 
@@ -367,8 +502,11 @@ final class NovelReaderViewModel: ObservableObject {
         guard isActive,
               appendOperationID == nil,
               !isLoadingNext,
+              !appendFailed,
               let last = loadedChapters.last,
-              let next = chapterAfter(last.chapter) else { return }
+              let next = chapterAfter(last.chapter),
+              // Never append a chapter twice; ordering must not loop back to a loaded one.
+              !loadedChapters.contains(where: { $0.chapter.key == next.key }) else { return }
 
         let operationID = UUID()
         let session = sessionID
@@ -455,6 +593,7 @@ final class NovelReaderViewModel: ObservableObject {
             )
             return
         }
+        appendFailed = true
         finishAppend(operationID: operationID, outcome: .failed(.pluginExecution))
     }
 
@@ -487,27 +626,49 @@ final class NovelReaderViewModel: ObservableObject {
 
     // MARK: - Chapter effects
 
-    func markChapterRead(_ chapter: Novel.Chapter) {
+    /// Records the chapter in history once per reader session; crossing back and forth over a
+    /// chapter boundary does not add a row each time.
+    private func chapterOpened(_ chapter: Novel.Chapter) {
+        guard isActive, historyChapterKeys.insert(chapter.key).inserted else { return }
+        dependencies.history.recordNovel(
+            novel,
+            chapterKey: chapter.key,
+            chapterTitle: chapter.title ?? chapter.key,
+            pluginID: pluginID
+        )
+    }
+
+    private func saveOffset(_ offset: Int, in chapter: Novel.Chapter) {
+        if let lastSavedOffset,
+           lastSavedOffset.chapterKey == chapter.key,
+           lastSavedOffset.offset == offset {
+            return
+        }
+        lastSavedOffset = (chapter.key, offset)
+        let operationID = UUID()
+        let progress = dependencies.progress
+        let identity = mediaIdentity
+        let preceding = offsetWriteTask
+        let task = Task { @MainActor [weak self, progress] in
+            defer { self?.finishTestingOperation(operationID) }
+            await preceding?.value
+            // Saving the position is best effort; reading carries on if it fails.
+            try? await progress.saveNovelOffset(offset, media: identity, chapterID: chapter.key)
+        }
+        offsetWriteTask = task
+        retainTestingOperation(task, operationID: operationID)
+    }
+
+    func markChapterFinished(_ chapter: Novel.Chapter) {
         guard isActive else { return }
-        let chapterTitle = chapter.title ?? chapter.key
-        let plan = ReaderSessionEffectPlan.chapterRead(
+        let plan = ReaderSessionEffectPlan.chapterFinished(
             chapterNumber: chapter.chapter,
-            titleOrKey: chapterTitle,
-            alreadyMarked: false
+            titleOrKey: chapter.title ?? chapter.key,
+            alreadyMarked: finishedChapterKeys.contains(chapter.key)
         )
 
-        for effect in plan.synchronousEffects {
-            if case .recordHistory = effect {
-                dependencies.history.recordNovel(
-                    novel,
-                    chapterKey: chapter.key,
-                    chapterTitle: chapterTitle,
-                    pluginID: pluginID
-                )
-            }
-        }
-
-        guard !plan.asynchronousEffects.isEmpty else { return }
+        guard !plan.effects.isEmpty else { return }
+        finishedChapterKeys.insert(chapter.key)
         let operationID = UUID()
         let session = sessionID
         let progress = dependencies.progress
@@ -518,14 +679,8 @@ final class NovelReaderViewModel: ObservableObject {
         let task = Task { @MainActor [weak self, progress, tracker] in
             defer { self?.finishTestingOperation(operationID) }
             do {
-                for effect in plan.asynchronousEffects {
-                    guard let self,
-                          self.isCurrentEffect(operationID: operationID, session: session) else {
-                        return
-                    }
+                for effect in plan.effects {
                     switch effect {
-                    case .recordHistory:
-                        break
                     case .markLocalProgress:
                         try await progress.markNovelChapterRead(
                             media: identity,
@@ -533,10 +688,9 @@ final class NovelReaderViewModel: ObservableObject {
                             chapterNumber: chapter.chapter
                         )
                     case .updateTracker(let progressValue):
-                        guard self.isCurrentEffect(
-                            operationID: operationID,
-                            session: session
-                        ) else { return }
+                        guard let self,
+                              self.isCurrentEffect(operationID: operationID, session: session)
+                        else { return }
                         await tracker.updateNovelProgress(
                             media: identity,
                             progress: progressValue
@@ -569,39 +723,64 @@ final class NovelReaderViewModel: ObservableObject {
 
     // MARK: - Settings
 
+    /// Font sizes the reader offers.
+    static let fontSizeRange: ClosedRange<Double> = 10...40
+    /// Line spacings the reader offers; the stored preference accepts the same range.
+    static let lineSpacingRange: ClosedRange<Double> = 0...40
+
+    // Each setter shows the choice at once, then saves it; a failed save puts back the saved
+    // value. Showing it at once also means quick repeated taps build on each other.
+
     func setFontSize(_ value: Double) {
+        guard isActive else { return }
+        let clamped = min(max(value, Self.fontSizeRange.lowerBound), Self.fontSizeRange.upperBound)
+        fontSize = clamped
         enqueueSettingsWrite(kind: .fontSize) {
-            try await $0.setNovelFontSize(value)
+            try await $0.setNovelFontSize(clamped)
         }
     }
 
     func setLineSpacing(_ value: Double) {
+        guard isActive else { return }
+        let clamped = min(max(value, Self.lineSpacingRange.lowerBound), Self.lineSpacingRange.upperBound)
+        lineSpacing = clamped
         enqueueSettingsWrite(kind: .lineSpacing) {
-            try await $0.setNovelLineSpacing(value)
+            try await $0.setNovelLineSpacing(clamped)
         }
     }
 
     func setFontFamily(_ value: NovelFont) {
-        guard let preference = NovelFontPreference(rawValue: value.rawValue) else { return }
+        guard isActive, let preference = NovelFontPreference(rawValue: value.rawValue) else { return }
+        fontFamily = value
         enqueueSettingsWrite(kind: .fontFamily) {
             try await $0.setNovelFontFamily(preference)
         }
     }
 
     func setTheme(_ value: NovelTheme) {
-        guard let preference = NovelThemePreference(rawValue: value.rawValue) else { return }
+        guard isActive, let preference = NovelThemePreference(rawValue: value.rawValue) else { return }
+        theme = value
         enqueueSettingsWrite(kind: .theme) {
             try await $0.setNovelTheme(preference)
         }
     }
 
     func setIsPaging(_ value: Bool) {
+        guard isActive else { return }
+        // The other mode opens where this one was; the continuous view leaving the screen
+        // must not move that place, so its callbacks are ignored while paging.
+        if value != isPaging, loadPhase == .content, let lastPosition {
+            restoreAnchor = lastPosition
+        }
+        isPaging = value
         enqueueSettingsWrite(kind: .isPaging) {
             try await $0.setNovelIsPaging(value)
         }
     }
 
     func setPrefetchChapters(_ value: Bool) {
+        guard isActive else { return }
+        prefetchChapters = value
         enqueueSettingsWrite(kind: .prefetchChapters) {
             try await $0.setNovelPrefetchChapters(value)
         }
@@ -641,6 +820,10 @@ final class NovelReaderViewModel: ObservableObject {
             do {
                 try await operation(settings)
             } catch {
+                // Put back the saved value, unless a newer choice is still being saved.
+                if self.settingsWriteGenerations[kind] == generation {
+                    self.applySetting(kind, from: settings.novelReaderSettings)
+                }
                 self.finishSettingsWrite(
                     kind: kind,
                     generation: generation,
@@ -662,7 +845,7 @@ final class NovelReaderViewModel: ObservableObject {
             }
             let outcome: PresentationEventOutcome
             if self.settingsWriteGenerations[kind] == generation {
-                self.applySettings(settings.novelReaderSettings)
+                self.applySetting(kind, from: settings.novelReaderSettings)
                 outcome = .succeeded
             } else {
                 outcome = .ignoredStale
@@ -693,13 +876,22 @@ final class NovelReaderViewModel: ObservableObject {
         settingsWriteOperationIDs[kind] = nil
     }
 
+    /// Takes saved settings, except those with a newer choice still being saved.
     private func applySettings(_ settings: NovelReaderSettingsSnapshot) {
-        fontSize = settings.fontSize
-        lineSpacing = settings.lineSpacing
-        fontFamily = NovelFont(rawValue: settings.fontFamily.rawValue) ?? .system
-        theme = NovelTheme(rawValue: settings.theme.rawValue) ?? .system
-        isPaging = settings.isPaging
-        prefetchChapters = settings.prefetchChapters
+        for kind in NovelReaderSettingKind.allCases where settingsWriteOperationIDs[kind] == nil {
+            applySetting(kind, from: settings)
+        }
+    }
+
+    private func applySetting(_ kind: NovelReaderSettingKind, from settings: NovelReaderSettingsSnapshot) {
+        switch kind {
+        case .fontSize: fontSize = settings.fontSize
+        case .lineSpacing: lineSpacing = settings.lineSpacing
+        case .fontFamily: fontFamily = NovelFont(rawValue: settings.fontFamily.rawValue) ?? .system
+        case .theme: theme = NovelTheme(rawValue: settings.theme.rawValue) ?? .system
+        case .isPaging: isPaging = settings.isPaging
+        case .prefetchChapters: prefetchChapters = settings.prefetchChapters
+        }
     }
 
     // MARK: - Discord presence
@@ -714,7 +906,7 @@ final class NovelReaderViewModel: ObservableObject {
         dependencies.presence.presentNovelReaderPresence(
             NovelReaderPresence(
                 details: novel.title,
-                state: "Reading \(chapter.title ?? "Chapter \(chapter.chapter ?? 0)")",
+                state: "Reading \(ReaderChapterTitle.text(title: chapter.title, number: chapter.chapter))",
                 activityType: 3,
                 detailsURL: detailsURL,
                 largeImageText: "Reading from \(scanlator) at \(pluginName)",
@@ -746,6 +938,7 @@ final class NovelReaderViewModel: ObservableObject {
         appendTask = nil
         appendOperationID = nil
         isLoadingNext = false
+        appendFailed = false
     }
 
     private func logStarted(kind: PresentationEventKind, operationID: UUID) {
@@ -805,7 +998,7 @@ final class NovelReaderViewModel: ObservableObject {
 #endif
 }
 
-private enum NovelReaderSettingKind: Hashable {
+private enum NovelReaderSettingKind: Hashable, CaseIterable {
     case fontSize
     case lineSpacing
     case fontFamily
