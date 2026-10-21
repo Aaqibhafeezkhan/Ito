@@ -42,6 +42,11 @@ final class SourceViewModel: ObservableObject {
     @Published private(set) var settingsSchema: SettingsSchema?
     /// Why the plugin's settings can't be shown, when it has settings but they couldn't be read.
     @Published private(set) var settingsUnavailableReason: String?
+    /// Whether the last load failed because the plugin needs settings (missing, or rejected
+    /// credentials), so the failure offers to open them.
+    @Published private(set) var failureNeedsSettings = false
+    /// The same for the last search.
+    @Published private(set) var searchFailureNeedsSettings = false
     @Published private(set) var searchMangas: [Manga] = []
     @Published private(set) var searchAnimes: [Anime] = []
     @Published private(set) var searchNovels: [Novel] = []
@@ -117,6 +122,7 @@ final class SourceViewModel: ObservableObject {
         let operationID = UUID()
         searchOperationID = operationID
         searchPhase = .loading
+        searchFailureNeedsSettings = false
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             if let searchDebounceNanoseconds {
@@ -159,6 +165,16 @@ final class SourceViewModel: ObservableObject {
     /// Whether the source offers settings, even ones that can't be shown right now.
     var hasSettings: Bool {
         settingsSchema != nil || settingsUnavailableReason != nil
+    }
+
+    /// Whether the load failure should offer the settings: it needs them and they can be edited.
+    var failureOffersSettings: Bool {
+        failureNeedsSettings && settingsDestination != nil
+    }
+
+    /// Whether the search failure should offer the settings, as for a load failure.
+    var searchFailureOffersSettings: Bool {
+        searchFailureNeedsSettings && settingsDestination != nil
     }
 
     func destination(for manga: Manga) -> SearchDestination? {
@@ -237,6 +253,7 @@ final class SourceViewModel: ObservableObject {
         loadOperationID = operationID
         phase = .loading
         homeLayout = nil
+        failureNeedsSettings = false
 
         if invalidateCachedRunner {
             runnerProvider.evictSourceRunner(for: plugin.id)
@@ -263,11 +280,9 @@ final class SourceViewModel: ObservableObject {
             try Task.checkCancellation()
             let settings = try await loadSettings(from: nextContext)
             try Task.checkCancellation()
-            let layout = try await nextContext.loadHome()
-            try Task.checkCancellation()
             guard isCurrentLoad(operationID) else { return }
-
-            context = nextContext
+            // Published before the home loads: a home that fails for want of settings needs the
+            // settings button to recover.
             switch settings {
             case .schema(let schema):
                 settingsSchema = schema
@@ -276,6 +291,11 @@ final class SourceViewModel: ObservableObject {
                 settingsSchema = nil
                 settingsUnavailableReason = reason
             }
+            let layout = try await nextContext.loadHome()
+            try Task.checkCancellation()
+            guard isCurrentLoad(operationID) else { return }
+
+            context = nextContext
             homeLayout = layout
             phase = layout.components.isEmpty ? .empty : .content
             finishLoad(operationID)
@@ -287,6 +307,7 @@ final class SourceViewModel: ObservableObject {
             guard isCurrentLoad(operationID), !Task.isCancelled else { return }
             discardRunnerIfCrashed(error)
             let reason = error.localizedDescription
+            failureNeedsSettings = (error as? PluginCallError)?.kind == .needsSettings
             phase = .failure(reason)
             messagePresenter.present(.loadFailed(pluginName: plugin.info.name, reason: reason))
             finishLoad(operationID)
@@ -357,6 +378,7 @@ final class SourceViewModel: ObservableObject {
     private func publishSearchFailure(_ error: any Error, operationID: UUID) {
         guard isCurrentSearch(operationID), !Task.isCancelled else { return }
         let reason = error.localizedDescription
+        searchFailureNeedsSettings = (error as? PluginCallError)?.kind == .needsSettings
         searchPhase = .failure(reason)
         messagePresenter.present(.searchFailed(pluginName: plugin.info.name, reason: reason))
         finishSearch(operationID)

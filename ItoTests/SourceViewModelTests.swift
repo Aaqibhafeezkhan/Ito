@@ -245,6 +245,57 @@ final class SourceViewModelTests: XCTestCase {
         XCTAssertTrue(provider.evictedPluginIDs.isEmpty)
     }
 
+    func testAHomeThatNeedsSettingsOffersThemAndOtherFailuresDoNot() async throws {
+        let unconfigured = PR7BSourceRunnerContextSpy()
+        unconfigured.settingsResult = .success(try pr7bSettingsSchema(settings: [
+            .text(id: "server_url", name: "Server URL", summary: nil, defaultValue: "")
+        ]))
+        unconfigured.homeResult = .failure(PluginCallError(kind: .needsSettings, message: "Add your server URL"))
+        let unreachable = PR7BSourceRunnerContextSpy()
+        unreachable.homeResult = .failure(PluginCallError(kind: .reported, message: "Komga didn't respond"))
+        let viewModel = makeViewModel(provider: PR7BSourceRunnerProviderSpy(contexts: [unconfigured, unreachable]))
+
+        await viewModel.loadIfNeeded()
+
+        XCTAssertEqual(viewModel.phase, .failure("Add your server URL"))
+        XCTAssertTrue(viewModel.failureOffersSettings)
+        XCTAssertNotNil(viewModel.settingsDestination, "the settings must be reachable from the failure")
+
+        await viewModel.reloadAfterSettingsChange()
+
+        XCTAssertEqual(viewModel.phase, .failure("Komga didn't respond"))
+        XCTAssertFalse(viewModel.failureOffersSettings)
+    }
+
+    func testSettingsAreOnlyOfferedWhenTheyCanBeEdited() async {
+        let context = PR7BSourceRunnerContextSpy()
+        context.settingsResult = .failure(PluginCallError(kind: .incompatible, message: "Needs a newer Ito."))
+        context.homeResult = .failure(PluginCallError(kind: .needsSettings, message: "Add your server URL"))
+        let viewModel = makeViewModel(provider: PR7BSourceRunnerProviderSpy(contexts: [context]))
+
+        await viewModel.loadIfNeeded()
+
+        XCTAssertTrue(viewModel.failureNeedsSettings)
+        XCTAssertFalse(viewModel.failureOffersSettings, "the unavailable-settings sheet can't fix anything")
+    }
+
+    func testASearchThatNeedsSettingsOffersThem() async throws {
+        let context = PR7BSourceRunnerContextSpy()
+        context.settingsResult = .success(try pr7bSettingsSchema(settings: [
+            .secret(id: "api_key", name: "API key", summary: nil)
+        ]))
+        context.homeResult = .success(pr7bHome(ids: ["home"]))
+        context.searchResult = .failure(PluginCallError(kind: .needsSettings, message: "Komga rejected the API key"))
+        let viewModel = makeViewModel(provider: PR7BSourceRunnerProviderSpy(contexts: [context]), debounce: nil)
+        await viewModel.loadIfNeeded()
+
+        viewModel.performSearch(query: "night")
+        await pr7bWaitUntil { viewModel.searchPhase != .loading }
+
+        XCTAssertEqual(viewModel.searchPhase, .failure("Komga rejected the API key"))
+        XCTAssertTrue(viewModel.searchFailureOffersSettings)
+    }
+
     func testSearchPreservesPageOneEmptyFilterInvocationAndResultOrdering() async {
         let context = PR7BSourceRunnerContextSpy()
         context.searchResult = .success(.manga([

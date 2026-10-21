@@ -81,7 +81,10 @@ struct SourceView: View {
         case .idle, .loading:
             ProgressView("Loading Source...")
         case .failure(let error):
-            failureView(message: "Error: \(error)") {
+            failureView(
+                message: "Error: \(error)",
+                opensSettings: viewModel.failureOffersSettings
+            ) {
                 Task { await viewModel.retry() }
             }
         case .cancelled:
@@ -382,7 +385,7 @@ struct SourceView: View {
         case .idle, .loading:
             ProgressView("Searching source...")
         case .failure(let error):
-            failureView(message: "Search error: \(error)") {
+            failureView(message: "Search error: \(error)", opensSettings: viewModel.searchFailureOffersSettings) {
                 viewModel.performSearch(query: viewModel.searchQuery)
             }
         case .cancelled:
@@ -447,11 +450,22 @@ struct SourceView: View {
         }
     }
 
-    private func failureView(message: String, retry: @escaping () -> Void) -> some View {
+    /// A failure with Retry, and Open Settings when the plugin needs settings to recover.
+    private func failureView(
+        message: String,
+        opensSettings: Bool = false,
+        retry: @escaping () -> Void
+    ) -> some View {
         VStack(spacing: 12) {
             Text(message).foregroundColor(.red)
-            Button("Retry", action: retry)
-                .buttonStyle(.bordered)
+            HStack(spacing: 12) {
+                if opensSettings {
+                    Button("Open Settings") { viewModel.showSettings = true }
+                        .buttonStyle(.borderedProminent)
+                }
+                Button("Retry", action: retry)
+                    .buttonStyle(.bordered)
+            }
         }
     }
 }

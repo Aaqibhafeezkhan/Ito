@@ -24,6 +24,32 @@ struct PluginCallErrorTests {
     }
 
     @Test(arguments: [
+        (PluginErrorCategory.needsSetup, PluginCallError.Kind.needsSettings),
+        (.unauthorized, .needsSettings),
+        (.network, .reported),
+        (.server, .reported),
+        (.notFound, .reported),
+        (.other, .reported)
+    ])
+    func failuresTheSettingsCanFixPointThere(_ category: PluginErrorCategory, _ kind: PluginCallError.Kind) {
+        let error = PluginCallError(.pluginFailed(function: "get_home", reason: "Add your server URL", category: category))
+
+        #expect(error == PluginCallError(kind: kind, message: "Add your server URL"))
+    }
+
+    @Test func aDataFormatFailureIsAnIncompatibilityWhateverItsCategory() {
+        let error = PluginCallError(.pluginFailed(
+            function: "get_home", reason: "Serialization error: value too large", category: .needsSetup
+        ))
+        #expect(error.kind == .incompatible)
+    }
+
+    @Test func aSettingsFailureWithoutAReasonGetsTheGenericMessage() {
+        let error = PluginCallError(.pluginFailed(function: "get_home", reason: nil, category: .needsSetup))
+        #expect(error == PluginCallError(kind: .needsSettings, message: "The source couldn't complete this request."))
+    }
+
+    @Test(arguments: [
         ItoError.wasmTrap("unreachable"),
         .memoryOutOfBounds(offset: 1, length: 2, memorySize: 3),
         .invalidDescriptor(id: 7)
