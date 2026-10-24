@@ -32,10 +32,13 @@ final class AtsuPluginLiveImageIntegrationTests: XCTestCase {
 
         // 2. Load runner using ItoRunner configured with AppNetModule and loadBundle
         let runner = ItoRunner()
-        await runner.setNetModule(AppNetModule())
+        await runner.setNetModule(AppNetModule(
+            pluginID: "com.kunihir0.ito.atsumaru",
+            cookieJar: PluginCookieJar(keychain: InMemoryPluginSecretKeychain()),
+            trust: PluginTrustStore(keychain: InMemoryPluginSecretKeychain())
+        ))
         await runner.setStdModule(DefaultStdModule())
         await runner.setHtmlModule(DefaultHtmlModule())
-        await runner.setJsModule(DefaultJsModule())
         await runner.setWebviewModule(AppWebviewModule())
         _ = try await runner.loadBundle(from: pluginURL)
         // 3. Request manga update (details + chapters) for user's sample "YMv6"

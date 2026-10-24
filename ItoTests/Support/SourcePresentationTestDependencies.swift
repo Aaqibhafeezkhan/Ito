@@ -311,10 +311,27 @@ final class PR7BPluginStatePublisherSpy: SourcePluginStatePublishing {
     private(set) var callCount = 0
     private(set) var publishCount = 0
     private(set) var removedSecretsPluginIDs: [String] = []
+    var completionHoldError: (any Error)?
+    var trustRevocationError: (any Error)?
+    private(set) var revokedTrustPluginIDs: [String] = []
+    private(set) var purgedCompletionPluginIDs: [String] = []
     private var continuations: [CheckedContinuation<Void, any Error>] = []
 
     func currentSourcePlugin(for pluginID: String) -> InstalledPlugin? {
         currentPlugins[pluginID]
+    }
+
+    func holdCompletionDelivery(for pluginID: String) async throws {
+        if let completionHoldError { throw completionHoldError }
+    }
+
+    func revokeTrust(for pluginID: String) throws {
+        revokedTrustPluginIDs.append(pluginID)
+        if let trustRevocationError { throw trustRevocationError }
+    }
+
+    func purgeCompletionDelivery(for pluginID: String) async {
+        purgedCompletionPluginIDs.append(pluginID)
     }
 
     func removeSecrets(for pluginID: String) {

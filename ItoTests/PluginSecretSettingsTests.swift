@@ -46,7 +46,7 @@ struct PluginSecretSettingsTests {
         #expect(module.get(key: "api_key") == nil)
     }
 
-    @Test func aPluginRemovingASettingAlsoForgetsTheSecret() throws {
+    @Test func aPluginRemovingASettingKeepsTheUsersSecret() throws {
         let database = try TestDatabase()
         defer { database.cleanup() }
         let store = makeStore(database)
@@ -55,8 +55,96 @@ struct PluginSecretSettingsTests {
 
         module.remove(key: "api_key")
 
-        #expect(module.get(key: "api_key") == nil)
-        #expect(store.secrets.value(pluginID: "komga", key: "api_key") == nil)
+        #expect(module.get(key: "api_key") == "secret")
+        #expect(store.secrets.value(pluginID: "komga", key: "api_key") == "secret")
+    }
+
+    @Test func aTokenIsReadBackButNeverReachesTheDatabase() throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let store = makeStore(database)
+        let module = AppDefaultsModule(pluginId: "komga", store: store)
+        module.set(key: "token", value: "plain-copy")
+
+        module.setSecret(key: "token", value: "access-token")
+
+        #expect(module.get(key: "token") == "access-token")
+        #expect(try settingRowCount(database, key: "token") == 0)
+        #expect(store.secrets.value(pluginID: "komga", key: "token") == nil)
+    }
+
+    @Test func aTokenNeverReplacesTheUsersSecret() throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let store = makeStore(database)
+        let module = AppDefaultsModule(pluginId: "komga", store: store)
+        store.setSecret(pluginId: "komga", key: "api_key", value: "typed")
+
+        module.setSecret(key: "api_key", value: "from-plugin")
+
+        #expect(module.get(key: "api_key") == "typed")
+        #expect(store.tokens.value(pluginID: "komga", key: "api_key") == nil)
+    }
+
+    @Test func removingForgetsTheTokenAndPlainValue() throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let store = makeStore(database)
+        let module = AppDefaultsModule(pluginId: "komga", store: store)
+        module.setSecret(key: "token", value: "access-token")
+        module.set(key: "other", value: "plain")
+
+        module.remove(key: "token")
+        module.remove(key: "other")
+
+        #expect(module.get(key: "token") == nil)
+        #expect(module.get(key: "other") == nil)
+    }
+
+    @Test func aSnapshotLayersSecretsOverTokensOverPlainValues() throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let store = makeStore(database)
+        let module = AppDefaultsModule(pluginId: "komga", store: store)
+        module.set(key: "plain", value: "p")
+        module.set(key: "token", value: "p")
+        module.setSecret(key: "token", value: "t")
+        module.setSecret(key: "both", value: "t")
+        store.setSecret(pluginId: "komga", key: "both", value: "s")
+
+        let snapshot = try store.snapshot(pluginId: "komga")
+
+        #expect(snapshot["plain"] == "p")
+        #expect(snapshot["token"] == "t")
+        #expect(snapshot["both"] == "s")
+    }
+
+    @Test func refreshingATokenKeepsImageCaches() throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let store = makeStore(database)
+        let module = AppDefaultsModule(pluginId: "komga", store: store)
+        let before = try database.dbPool.read { db in try PluginImageCacheEpoch.current(in: db) }
+
+        module.setSecret(key: "token", value: "first")
+        module.setSecret(key: "token", value: "refreshed")
+        module.remove(key: "token")
+
+        let after = try database.dbPool.read { db in try PluginImageCacheEpoch.current(in: db) }
+        #expect(after == before)
+    }
+
+    @Test func aLaterPlainValueReplacesAToken() throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let store = makeStore(database)
+        let module = AppDefaultsModule(pluginId: "komga", store: store)
+        module.setSecret(key: "auth", value: "token")
+
+        module.set(key: "auth", value: "plain")
+
+        #expect(module.get(key: "auth") == "plain")
+        #expect(store.tokens.value(pluginID: "komga", key: "auth") == nil)
     }
 
     @Test func removingAPluginsSecretsKeepsEveryOtherPlugin() throws {
@@ -109,7 +197,9 @@ struct PluginSecretSettingsTests {
         PluginSettingsStore(
             dbPool: database.dbPool,
             domainFactory: { SecretTestPluginDomain(name: $0) },
-            secrets: PluginSecretStore(keychain: InMemoryPluginSecretKeychain())
+            secrets: PluginSecretStore(keychain: InMemoryPluginSecretKeychain()),
+            cookies: PluginCookieJar(keychain: InMemoryPluginSecretKeychain()),
+            tokens: PluginSecretStore(keychain: InMemoryPluginSecretKeychain())
         )
     }
 
@@ -122,18 +212,32 @@ struct PluginSecretSettingsTests {
 
 @MainActor
 struct FirstRunSetupTests {
-    @Test func setupRunsOnceAddingTheRepositoryAndClearingLeftoverSecrets() async throws {
+    @Test func setupRunsOnceAddingTheRepositoryAndClearingLeftoverCredentials() async throws {
         let database = try TestDatabase()
         defer { database.cleanup() }
         let keychain = InMemoryPluginSecretKeychain()
         let secrets = PluginSecretStore(keychain: keychain)
         try secrets.setValue("from-an-old-install", pluginID: "com.atiinlabs.komga", key: "api_key")
-        let setup = FirstRunSetupBootstrapExtension(secrets: secrets)
-
+        let cookieKeychain = InMemoryPluginSecretKeychain()
+        let cookies = PluginCookieJar(keychain: cookieKeychain)
+        try cookies.store([try #require(HTTPCookie(properties: [
+            .name: "session", .value: "old", .domain: "example.com", .path: "/"
+        ]))], pluginID: "com.atiinlabs.komga")
+        let tokenKeychain = InMemoryPluginSecretKeychain()
+        let tokens = PluginSecretStore(keychain: tokenKeychain)
+        try tokens.setValue("old-token", pluginID: "com.atiinlabs.komga", key: "token")
+        let trustKeychain = InMemoryPluginSecretKeychain()
+        let trust = PluginTrustStore(keychain: trustKeychain)
+        try trust.trust(fingerprint: "AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899", host: "example.com", pluginID: "com.atiinlabs.komga")
+        let setup = FirstRunSetupBootstrapExtension(secrets: secrets, cookies: cookies, tokens: tokens, trust: trust)
         try await setup.prepare(dbPool: database.dbPool)
 
         #expect(try await repositoryURLs(database) == [RepoManager.defaultRepositoryURL])
         #expect(keychain.storedAccounts.isEmpty)
+        #expect(cookieKeychain.storedAccounts.isEmpty)
+        #expect(tokenKeychain.storedAccounts.isEmpty)
+        #expect(trustKeychain.storedAccounts.isEmpty)
+        #expect(trust.pinnedFingerprint(pluginID: "com.atiinlabs.komga", host: "example.com") == nil)
 
         // The user then signs in and removes the repository; later launches change neither.
         try secrets.setValue("current", pluginID: "com.atiinlabs.komga", key: "api_key")
@@ -149,15 +253,50 @@ struct FirstRunSetupTests {
     @Test func aLockedKeychainDefersTheWholeSetupToTheNextLaunch() async throws {
         let database = try TestDatabase()
         defer { database.cleanup() }
-        let keychain = InMemoryPluginSecretKeychain()
-        keychain.failingStatus = errSecInteractionNotAllowed
-        let setup = FirstRunSetupBootstrapExtension(secrets: PluginSecretStore(keychain: keychain))
+        let cookieKeychain = InMemoryPluginSecretKeychain()
+        cookieKeychain.failingStatus = errSecInteractionNotAllowed
+        let setup = FirstRunSetupBootstrapExtension(
+            secrets: PluginSecretStore(keychain: InMemoryPluginSecretKeychain()),
+            cookies: PluginCookieJar(keychain: cookieKeychain),
+            tokens: PluginSecretStore(keychain: InMemoryPluginSecretKeychain()),
+            trust: PluginTrustStore(keychain: InMemoryPluginSecretKeychain())
+        )
 
         try await setup.prepare(dbPool: database.dbPool)
         #expect(try await repositoryURLs(database).isEmpty)
 
-        keychain.failingStatus = nil
+        cookieKeychain.failingStatus = nil
         try await setup.prepare(dbPool: database.dbPool)
+        #expect(try await repositoryURLs(database) == [RepoManager.defaultRepositoryURL])
+    }
+
+    @Test func aFailedTrustCleanupLeavesNoEarlierPinUsable() async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let trustKeychain = InMemoryPluginSecretKeychain()
+        let trust = PluginTrustStore(keychain: trustKeychain)
+        try trust.trust(fingerprint: "AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899", host: "example.com", pluginID: "com.atiinlabs.komga")
+        let secrets = PluginSecretStore(keychain: InMemoryPluginSecretKeychain())
+        try secrets.setValue("from-an-old-install", pluginID: "com.atiinlabs.komga", key: "api_key")
+        let setup = FirstRunSetupBootstrapExtension(
+            secrets: secrets,
+            cookies: PluginCookieJar(keychain: InMemoryPluginSecretKeychain()),
+            tokens: PluginSecretStore(keychain: InMemoryPluginSecretKeychain()),
+            trust: trust
+        )
+
+        trustKeychain.failingStatus = errSecInteractionNotAllowed
+        try await setup.prepare(dbPool: database.dbPool)
+        trustKeychain.failingStatus = nil
+
+        // The setup is deferred, and the pin left in the Keychain authorizes nothing this launch.
+        #expect(try await repositoryURLs(database).isEmpty)
+        #expect(trustKeychain.storedAccounts == ["com.atiinlabs.komga"])
+        #expect(trust.pinnedFingerprint(pluginID: "com.atiinlabs.komga", host: "example.com") == nil)
+
+        try await setup.prepare(dbPool: database.dbPool)
+        #expect(trustKeychain.storedAccounts.isEmpty)
+        #expect(secrets.value(pluginID: "com.atiinlabs.komga", key: "api_key") == nil)
         #expect(try await repositoryURLs(database) == [RepoManager.defaultRepositoryURL])
     }
 
@@ -165,7 +304,10 @@ struct FirstRunSetupTests {
         let database = try TestDatabase()
         defer { database.cleanup() }
         let setup = FirstRunSetupBootstrapExtension(
-            secrets: PluginSecretStore(keychain: InMemoryPluginSecretKeychain())
+            secrets: PluginSecretStore(keychain: InMemoryPluginSecretKeychain()),
+            cookies: PluginCookieJar(keychain: InMemoryPluginSecretKeychain()),
+            tokens: PluginSecretStore(keychain: InMemoryPluginSecretKeychain()),
+            trust: PluginTrustStore(keychain: InMemoryPluginSecretKeychain())
         )
         try await setup.prepare(dbPool: database.dbPool)
         let repositories = RepoManager(

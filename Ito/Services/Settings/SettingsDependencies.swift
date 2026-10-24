@@ -83,12 +83,24 @@ protocol SiteDataClearing: AnyObject {
 
 @MainActor
 final class SystemSiteDataClearer: SiteDataClearing {
+    private let pluginCookies: PluginCookieJar?
+    private let pluginTokens: PluginSecretStore?
+
+    /// `pluginCookies` and `pluginTokens` hold the sources' sign-in cookies and the tokens they
+    /// stored, cleared with the rest: sources need signing in again afterwards.
+    init(pluginCookies: PluginCookieJar? = nil, pluginTokens: PluginSecretStore? = nil) {
+        self.pluginCookies = pluginCookies
+        self.pluginTokens = pluginTokens
+    }
+
     func clearSiteData() async throws {
         if let cookies = HTTPCookieStorage.shared.cookies {
             for cookie in cookies {
                 HTTPCookieStorage.shared.deleteCookie(cookie)
             }
         }
+        try pluginCookies?.removeEveryPlugin()
+        try pluginTokens?.removeAll()
         await withCheckedContinuation { continuation in
             WKWebsiteDataStore.default().removeData(
                 ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),

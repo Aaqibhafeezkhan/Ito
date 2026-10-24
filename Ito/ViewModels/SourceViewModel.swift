@@ -47,6 +47,15 @@ final class SourceViewModel: ObservableObject {
     @Published private(set) var failureNeedsSettings = false
     /// The same for the last search.
     @Published private(set) var searchFailureNeedsSettings = false
+    /// Whether the last load failed because the source needs a sign-in on its website.
+    @Published private(set) var failureNeedsLogin = false
+    /// Whether the last load failed and has an untrusted certificate waiting for user decision.
+    @Published private(set) var failurePendingTrust: PendingTrust?
+    /// The same for the last search.
+    @Published private(set) var searchFailureNeedsLogin = false
+    /// The pending trust for the last search failure, if any.
+    @Published private(set) var searchFailurePendingTrust: PendingTrust?
+    @Published var showSignIn = false
     @Published private(set) var searchMangas: [Manga] = []
     @Published private(set) var searchAnimes: [Anime] = []
     @Published private(set) var searchNovels: [Novel] = []
@@ -123,6 +132,8 @@ final class SourceViewModel: ObservableObject {
         searchOperationID = operationID
         searchPhase = .loading
         searchFailureNeedsSettings = false
+        searchFailureNeedsLogin = false
+        searchFailurePendingTrust = nil
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             if let searchDebounceNanoseconds {
@@ -226,6 +237,8 @@ final class SourceViewModel: ObservableObject {
             guard currentIdentity == archivedPluginFileSnapshot.identity else {
                 throw SourcePluginFileError.stalePluginIdentity
             }
+            try await pluginStatePublisher.holdCompletionDelivery(for: plugin.id)
+            try pluginStatePublisher.revokeTrust(for: plugin.id)
             transaction = try fileDeletion.stagePluginFileDeletion(
                 from: archivedPluginFileSnapshot
             )
@@ -236,6 +249,7 @@ final class SourceViewModel: ObservableObject {
             pluginStatePublisher.removeSecrets(for: plugin.id)
             shouldDismiss = true
             finishDeletion(operationID)
+            await pluginStatePublisher.purgeCompletionDelivery(for: plugin.id)
         } catch {
             let failure = restoreAfterFailedDeletion(
                 transaction: transaction,
@@ -254,6 +268,8 @@ final class SourceViewModel: ObservableObject {
         phase = .loading
         homeLayout = nil
         failureNeedsSettings = false
+        failureNeedsLogin = false
+        failurePendingTrust = nil
 
         if invalidateCachedRunner {
             runnerProvider.evictSourceRunner(for: plugin.id)
@@ -275,6 +291,7 @@ final class SourceViewModel: ObservableObject {
     }
 
     private func executeLoad(operationID: UUID) async {
+        runnerProvider.clearPendingTrust(for: plugin.id)
         do {
             let nextContext = try await runnerProvider.sourceRunnerContext(for: plugin.id)
             try Task.checkCancellation()
@@ -308,6 +325,8 @@ final class SourceViewModel: ObservableObject {
             discardRunnerIfCrashed(error)
             let reason = error.localizedDescription
             failureNeedsSettings = (error as? PluginCallError)?.kind == .needsSettings
+            failureNeedsLogin = (error as? PluginCallError)?.kind == .needsLogin
+            failurePendingTrust = runnerProvider.pendingTrust(for: plugin.id)
             phase = .failure(reason)
             messagePresenter.present(.loadFailed(pluginName: plugin.info.name, reason: reason))
             finishLoad(operationID)
@@ -332,7 +351,7 @@ final class SourceViewModel: ObservableObject {
             finishCancelledSearch(operationID)
             return
         }
-
+        runnerProvider.clearPendingTrust(for: plugin.id)
         do {
             let page = try await context.search(
                 pluginType: plugin.info.type,
@@ -379,6 +398,8 @@ final class SourceViewModel: ObservableObject {
         guard isCurrentSearch(operationID), !Task.isCancelled else { return }
         let reason = error.localizedDescription
         searchFailureNeedsSettings = (error as? PluginCallError)?.kind == .needsSettings
+        searchFailureNeedsLogin = (error as? PluginCallError)?.kind == .needsLogin
+        searchFailurePendingTrust = runnerProvider.pendingTrust(for: plugin.id)
         searchPhase = .failure(reason)
         messagePresenter.present(.searchFailed(pluginName: plugin.info.name, reason: reason))
         finishSearch(operationID)

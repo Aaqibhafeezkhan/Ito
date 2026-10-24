@@ -468,6 +468,7 @@ final class SourceViewModelTests: XCTestCase {
         XCTAssertEqual(publisher.callCount, 1)
         XCTAssertEqual(publisher.publishCount, 1)
         XCTAssertEqual(publisher.removedSecretsPluginIDs, [plugin.id])
+        XCTAssertEqual(publisher.purgedCompletionPluginIDs, [plugin.id])
         XCTAssertEqual(files.transaction.commitCount, 1)
         XCTAssertEqual(commitCountAtPublication, 1)
         XCTAssertEqual(files.transaction.rollbackCount, 0)
@@ -495,6 +496,47 @@ final class SourceViewModelTests: XCTestCase {
         XCTAssertFalse(viewModel.shouldDismiss)
         XCTAssertEqual(viewModel.archivedPluginDeleteError, "fixture failure")
         XCTAssertEqual(messages.messages.count, 1)
+    }
+
+    func testArchivedDeleteCompletionCancellationFailureStagesNothing() async {
+        let files = PR7BFileDeletionSpy()
+        let publisher = PR7BPluginStatePublisherSpy()
+        publisher.completionHoldError = PR7BTestFailure.failed
+        let viewModel = makeViewModel(
+            plugin: pr7bPlugin(archived: true),
+            publisher: publisher,
+            files: files
+        )
+        viewModel.requestArchivedPluginDeletion()
+
+        await viewModel.confirmArchivedPluginDeletion()
+
+        XCTAssertTrue(files.stagedSnapshots.isEmpty)
+        XCTAssertEqual(publisher.callCount, 0)
+        XCTAssertTrue(publisher.removedSecretsPluginIDs.isEmpty)
+        XCTAssertFalse(viewModel.shouldDismiss)
+        XCTAssertEqual(viewModel.archivedPluginDeleteError, "fixture failure")
+    }
+
+    func testArchivedDeleteTrustRevocationFailureStagesNothing() async {
+        let files = PR7BFileDeletionSpy()
+        let publisher = PR7BPluginStatePublisherSpy()
+        publisher.trustRevocationError = PR7BTestFailure.failed
+        let viewModel = makeViewModel(
+            plugin: pr7bPlugin(archived: true),
+            publisher: publisher,
+            files: files
+        )
+        viewModel.requestArchivedPluginDeletion()
+
+        await viewModel.confirmArchivedPluginDeletion()
+
+        XCTAssertEqual(publisher.revokedTrustPluginIDs, [pr7bPlugin(archived: true).id])
+        XCTAssertTrue(files.stagedSnapshots.isEmpty)
+        XCTAssertEqual(publisher.callCount, 0)
+        XCTAssertTrue(publisher.removedSecretsPluginIDs.isEmpty)
+        XCTAssertFalse(viewModel.shouldDismiss)
+        XCTAssertEqual(viewModel.archivedPluginDeleteError, "fixture failure")
     }
 
     func testArchivedDeletePublicationFailureRollsBackAndDoesNotDismiss() async {
@@ -565,6 +607,7 @@ final class SourceViewModelTests: XCTestCase {
         XCTAssertEqual(publisher.currentSourcePlugin(for: plugin.id)?.id, plugin.id)
         XCTAssertEqual(files.transaction.rollbackCount, 1)
         XCTAssertFalse(viewModel.shouldDismiss)
+        XCTAssertTrue(publisher.purgedCompletionPluginIDs.isEmpty)
     }
 
     func testDuplicateArchivedDeleteConfirmationsCannotOverlap() async {

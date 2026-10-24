@@ -20,6 +20,18 @@ struct PluginSettingsView: View {
         self._viewModel = StateObject(wrappedValue: viewModel)
     }
 
+    private var recoveryConfirmationTitle: String {
+        viewModel.completionRecoveryRequest == .discard
+            ? "Discard paused progress?"
+            : "Send paused progress to the current account?"
+    }
+
+    private var recoveryConfirmationMessage: String {
+        viewModel.completionRecoveryRequest == .discard
+            ? "Paused read progress for this source is deleted without being sent. Your local reading history is unchanged."
+            : "Paused read progress was recorded before this source's server or account settings changed. It is sent to the server and account configured now. Nothing is sent until you confirm."
+    }
+
     var body: some View {
         NavigationView {
             Form {
@@ -30,6 +42,26 @@ struct PluginSettingsView: View {
             .navigationBarItems(trailing: Button("Done") {
                 dismiss()
             })
+            .confirmationDialog(
+                recoveryConfirmationTitle,
+                isPresented: Binding(
+                    get: { viewModel.completionRecoveryRequest != nil },
+                    set: { if !$0 { viewModel.cancelCompletionRecoveryRequest() } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button(
+                    viewModel.completionRecoveryRequest == .discard ? "Discard" : "Send to Current Account",
+                    role: viewModel.completionRecoveryRequest == .discard ? .destructive : nil
+                ) {
+                    viewModel.confirmCompletionRecovery()
+                }
+                Button("Cancel", role: .cancel) {
+                    viewModel.cancelCompletionRecoveryRequest()
+                }
+            } message: {
+                Text(recoveryConfirmationMessage)
+            }
             .task {
                 await viewModel.loadIfNeeded()
             }
@@ -42,9 +74,11 @@ struct PluginSettingsView: View {
     @ViewBuilder
     private var settingsContent: some View {
         if viewModel.isPrepared {
+            formLevelIssuesSection
             ForEach(viewModel.schema.settings, id: \.id) { setting in
                 SettingRowView(setting: setting, viewModel: viewModel)
             }
+            actionsSection
             statusSections
         } else if let error = viewModel.loadError {
             Section {
@@ -66,7 +100,89 @@ struct PluginSettingsView: View {
     }
 
     @ViewBuilder
+    private var formLevelIssuesSection: some View {
+        if !viewModel.formLevelIssues.isEmpty {
+            Section {
+                ForEach(viewModel.formLevelIssues.indices, id: \.self) { index in
+                    Label(viewModel.formLevelIssues[index], systemImage: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.footnote)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var actionsSection: some View {
+        if !viewModel.actions.isEmpty {
+            Section(
+                header: Text("Diagnostics & Actions"),
+                footer: Text("Tests use unsaved secret values when provided, otherwise saved values.")
+            ) {
+                ForEach(viewModel.actions, id: \.id) { action in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(action.title)
+                            Spacer()
+                            if viewModel.runningActionID == action.id {
+                                ProgressView()
+                            } else {
+                                Button("Run") {
+                                    viewModel.runAction(action.id)
+                                }
+                                .disabled(viewModel.runningActionID != nil)
+                                .accessibilityLabel(action.title)
+                            }
+                        }
+                        if let summary = action.summary, !summary.isEmpty {
+                            Text(summary)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+
+                if viewModel.runningActionID != nil {
+                    Button("Cancel Action", role: .cancel) {
+                        viewModel.cancelRunningAction()
+                    }
+                }
+
+                if let success = viewModel.actionSuccessMessage {
+                    Label(success, systemImage: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.footnote)
+                }
+
+                if let error = viewModel.actionErrorMessage {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundColor(.red)
+                        .font(.footnote)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
     private var statusSections: some View {
+        if viewModel.isInspecting {
+            Section {
+                ProgressView("Validating plugin settings…")
+            }
+        }
+        if let error = viewModel.inspectError {
+            Section {
+                Label("Validation could not be completed.", systemImage: "exclamationmark.triangle")
+                    .foregroundColor(.orange)
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Retry Validation") {
+                    viewModel.retryInspection()
+                }
+            }
+        }
         if viewModel.isReloading {
             Section {
                 ProgressView("Reloading plugin settings…")
@@ -90,6 +206,47 @@ struct PluginSettingsView: View {
                     .foregroundColor(.red)
             }
         }
+        completionSection
+    }
+    @ViewBuilder
+    private var completionSection: some View {
+        if let presentation = viewModel.completionPresentation {
+            Section(header: Text("Read Progress Sync")) {
+                if presentation.pendingCount > 0 {
+                    Label(
+                        "\(presentation.pendingCount) waiting to sync",
+                        systemImage: "arrow.triangle.2.circlepath"
+                    )
+                }
+                if presentation.pausedCount > 0 {
+                    Label(
+                        "\(presentation.pausedCount) paused",
+                        systemImage: "pause.circle.fill"
+                    )
+                    .foregroundColor(.orange)
+                    ForEach(presentation.pauseReasons, id: \.self) { reason in
+                        Text(reason)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Retry with Current Account…") {
+                        viewModel.requestCompletionRecovery(.reauthorize)
+                    }
+                    .disabled(viewModel.isRecoveringCompletion)
+                    Button("Discard Paused Progress…", role: .destructive) {
+                        viewModel.requestCompletionRecovery(.discard)
+                    }
+                    .disabled(viewModel.isRecoveringCompletion)
+                }
+                if viewModel.isRecoveringCompletion {
+                    ProgressView("Updating queued progress…")
+                }
+                if let error = viewModel.completionRecoveryError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundColor(.red)
+                }
+            }
+        }
     }
 }
 
@@ -98,34 +255,44 @@ private struct SettingRowView: View {
     @ObservedObject var viewModel: PluginSettingsViewModel
 
     var body: some View {
-        switch setting {
-        case .toggle(let id, let name, let summary, let defaultValue):
-            ToggleSettingRow(
-                id: id,
-                name: name,
-                summary: summary,
-                defaultValue: defaultValue,
-                viewModel: viewModel
-            )
-        case .text(let id, let name, let summary, let defaultValue):
-            TextSettingRow(
-                id: id,
-                name: name,
-                summary: summary,
-                defaultValue: defaultValue,
-                viewModel: viewModel
-            )
-        case .picker(let id, let name, let summary, let options, let defaultValue):
-            PickerSettingRow(
-                id: id,
-                name: name,
-                summary: summary,
-                options: options,
-                defaultValue: defaultValue,
-                viewModel: viewModel
-            )
-        case .secret(let id, let name, let summary):
-            SecretSettingRow(id: id, name: name, summary: summary, viewModel: viewModel)
+        VStack(alignment: .leading, spacing: 4) {
+            switch setting {
+            case .toggle(let id, let name, let summary, let defaultValue):
+                ToggleSettingRow(
+                    id: id,
+                    name: name,
+                    summary: summary,
+                    defaultValue: defaultValue,
+                    viewModel: viewModel
+                )
+            case .text(let id, let name, let summary, let defaultValue):
+                TextSettingRow(
+                    id: id,
+                    name: name,
+                    summary: summary,
+                    defaultValue: defaultValue,
+                    viewModel: viewModel
+                )
+            case .picker(let id, let name, let summary, let options, let defaultValue):
+                PickerSettingRow(
+                    id: id,
+                    name: name,
+                    summary: summary,
+                    options: options,
+                    defaultValue: defaultValue,
+                    viewModel: viewModel
+                )
+            case .secret(let id, let name, let summary):
+                SecretSettingRow(id: id, name: name, summary: summary, viewModel: viewModel)
+            }
+
+            if let issues = viewModel.issuesBySettingKey[setting.id], !issues.isEmpty {
+                ForEach(issues.indices, id: \.self) { index in
+                    Label(issues[index], systemImage: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.caption)
+                }
+            }
         }
     }
 }
@@ -150,9 +317,6 @@ private struct ToggleSettingRow: View {
             }
         }
         .padding(.vertical, 2)
-        .onAppear {
-            viewModel.ensureDefault(key: id, value: Setting.storedToggle(defaultValue))
-        }
     }
 }
 
@@ -179,9 +343,6 @@ private struct TextSettingRow: View {
             }
         }
         .padding(.vertical, 2)
-        .onAppear {
-            viewModel.ensureDefault(key: id, value: defaultValue)
-        }
     }
 }
 
@@ -210,9 +371,6 @@ private struct PickerSettingRow: View {
             }
         }
         .padding(.vertical, 2)
-        .onAppear {
-            viewModel.ensureDefault(key: id, value: defaultValue)
-        }
     }
 }
 
@@ -224,10 +382,10 @@ private struct SecretSettingRow: View {
     let name: String
     let summary: String?
     @ObservedObject var viewModel: PluginSettingsViewModel
-    @State private var draft = ""
 
     var body: some View {
         let isSaved = viewModel.hasSecret(key: id)
+        let draft = viewModel.secretDraft(key: id)
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(name)
@@ -238,12 +396,18 @@ private struct SecretSettingRow: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            SecureField(isSaved ? "Enter a new value to replace it" : name, text: $draft)
-                .textContentType(.oneTimeCode)
-                .textInputAutocapitalization(.never)
-                .disableAutocorrection(true)
-                .textFieldStyle(RoundedBorderTextFieldStyle())
-                .onSubmit(save)
+            SecureField(
+                isSaved ? "Enter a new value to replace it" : name,
+                text: Binding(
+                    get: { viewModel.secretDraft(key: id) },
+                    set: { viewModel.updateSecretDraft(key: id, value: $0) }
+                )
+            )
+            .textContentType(.oneTimeCode)
+            .textInputAutocapitalization(.never)
+            .disableAutocorrection(true)
+            .textFieldStyle(RoundedBorderTextFieldStyle())
+            .onSubmit(save)
             HStack {
                 if isSaved {
                     Button("Remove", role: .destructive) { viewModel.clearSecret(key: id) }
@@ -263,7 +427,6 @@ private struct SecretSettingRow: View {
     }
 
     private func save() {
-        guard viewModel.persistSecret(key: id, value: draft) else { return }
-        draft = ""
+        _ = viewModel.persistSecret(key: id, value: viewModel.secretDraft(key: id))
     }
 }

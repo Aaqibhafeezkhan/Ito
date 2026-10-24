@@ -332,6 +332,9 @@ private final class MessagePluginManager: BrowsePluginManaging {
     }
 
     func reloadInstalledPlugins() async {}
+    func holdCompletionDelivery(for pluginID: String) async throws {}
+    func purgeCompletionDelivery(for pluginID: String) async {}
+    func revokeTrust(for pluginID: String) throws {}
     func removeSecrets(for pluginID: String) {}
 }
 

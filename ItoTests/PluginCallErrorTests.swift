@@ -29,7 +29,8 @@ struct PluginCallErrorTests {
         (.network, .reported),
         (.server, .reported),
         (.notFound, .reported),
-        (.other, .reported)
+        (.other, .reported),
+        (.needsLogin, .needsLogin)
     ])
     func failuresTheSettingsCanFixPointThere(_ category: PluginErrorCategory, _ kind: PluginCallError.Kind) {
         let error = PluginCallError(.pluginFailed(function: "get_home", reason: "Add your server URL", category: category))
@@ -49,10 +50,18 @@ struct PluginCallErrorTests {
         #expect(error == PluginCallError(kind: .needsSettings, message: "The source couldn't complete this request."))
     }
 
+    @Test func aSignInRequestWithoutAReasonAsksTheUserToSignIn() {
+        for reason in [nil, ""] as [String?] {
+            let error = PluginCallError(.pluginFailed(function: "get_home", reason: reason, category: .needsLogin))
+            #expect(error == PluginCallError(kind: .needsLogin, message: "Sign in to this source to continue."))
+        }
+        let own = PluginCallError(.pluginFailed(function: "get_home", reason: "Host error: Log in first", category: .needsLogin))
+        #expect(own == PluginCallError(kind: .needsLogin, message: "Log in first"))
+    }
+
     @Test(arguments: [
         ItoError.wasmTrap("unreachable"),
-        .memoryOutOfBounds(offset: 1, length: 2, memorySize: 3),
-        .invalidDescriptor(id: 7)
+        .memoryOutOfBounds(offset: 1, length: 2, memorySize: 3)
     ])
     func aTrapOrBadMemoryAccessIsACrash(_ runnerError: ItoError) {
         #expect(PluginCallError(runnerError).kind == .crashed)

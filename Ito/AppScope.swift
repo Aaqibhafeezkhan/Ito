@@ -26,6 +26,10 @@ struct PreparedApplicationDependencies {
     let discoverCache: any DiscoverCaching
     let discoverClock: any DiscoverClock
     let discoverDebounceMilliseconds: Int?
+    let completionRecovery: (any PluginCompletionRecovering)?
+    let settingsDiagnostics: (any PluginSettingsDiagnosing)?
+    let pluginCookies: PluginCookieJar?
+    let pluginTrust: PluginTrustStore?
 
     init(
         settings: PreparedSettingsDependencies,
@@ -51,7 +55,11 @@ struct PreparedApplicationDependencies {
         discoverService: any DiscoverHomeFilterServing = DiscoverManager.shared,
         discoverCache: any DiscoverCaching = InMemoryDiscoverCache(),
         discoverClock: any DiscoverClock = SystemDiscoverClock(),
-        discoverDebounceMilliseconds: Int? = DiscoverViewModel.productionDebounceMilliseconds
+        discoverDebounceMilliseconds: Int? = DiscoverViewModel.productionDebounceMilliseconds,
+        completionRecovery: (any PluginCompletionRecovering)? = nil,
+        settingsDiagnostics: (any PluginSettingsDiagnosing)? = nil,
+        pluginCookies: PluginCookieJar? = nil,
+        pluginTrust: PluginTrustStore? = nil
     ) {
         self.settings = settings
         self.tracking = tracking ?? .unavailable()
@@ -77,6 +85,10 @@ struct PreparedApplicationDependencies {
         self.discoverCache = discoverCache
         self.discoverClock = discoverClock
         self.discoverDebounceMilliseconds = discoverDebounceMilliseconds
+        self.completionRecovery = completionRecovery
+        self.settingsDiagnostics = settingsDiagnostics
+        self.pluginCookies = pluginCookies
+        self.pluginTrust = pluginTrust
     }
 
     static func production(
@@ -99,7 +111,8 @@ struct PreparedApplicationDependencies {
         discoverDetailService: any DiscoverDetailServing,
         discoverDetailThemeService: any DiscoverDetailThemeServing,
         recentSearchDefaults: UserDefaults = .standard,
-        browsePluginsDirectory: URL? = nil
+        browsePluginsDirectory: URL? = nil,
+        completionRecovery: (any PluginCompletionRecovering)? = nil
     ) -> Self {
         let fileOperations = LocalBrowsePluginFileOperations(
             pluginsDirectory: browsePluginsDirectory
@@ -118,7 +131,11 @@ struct PreparedApplicationDependencies {
                 storageAccess: storageManager,
                 discordRPCManager: discordRPCManager,
                 logReader: SystemDebugLogReader(),
-                clipboardWriter: SystemClipboardWriter()
+                clipboardWriter: SystemClipboardWriter(),
+                siteDataClearer: SystemSiteDataClearer(
+                    pluginCookies: pluginManager.pluginSettingsStore.cookies,
+                    pluginTokens: pluginManager.pluginSettingsStore.tokens
+                )
             ),
             tracking: tracking,
             mediaDetail: .production(
@@ -204,7 +221,20 @@ struct PreparedApplicationDependencies {
                 sourceRouteFactory: SourceRouteFactory(),
                 libraryObserver: libraryManager,
                 trackerLinker: trackerManager
-            )
+            ),
+            completionRecovery: completionRecovery,
+            settingsDiagnostics: PluginSettingsDiagnosticService(
+                settingsStore: pluginManager.pluginSettingsStore,
+                locatePlugin: { pluginID in
+                    guard let plugin = pluginManager.installedPlugins[pluginID] else {
+                        throw URLError(.fileDoesNotExist)
+                    }
+                    if let refusal = plugin.info.compatibilityRefusal { throw refusal }
+                    return plugin.url
+                }
+            ),
+            pluginCookies: pluginManager.pluginSettingsStore.cookies,
+            pluginTrust: pluginManager.pluginSettingsStore.trust
         )
     }
 }
@@ -503,7 +533,11 @@ final class AppScope {
             libraryDependencies: preparedDependencies.library,
             categoryHistoryDependencies: preparedDependencies.categoryHistory,
             categoryHistoryMessagePresenter: categoryHistoryMessagePresenter,
-            presentationLogger: preparedDependencies.presentationLogger
+            presentationLogger: preparedDependencies.presentationLogger,
+            completionRecovery: preparedDependencies.completionRecovery,
+            settingsDiagnostics: preparedDependencies.settingsDiagnostics,
+            pluginCookies: preparedDependencies.pluginCookies,
+            pluginTrust: preparedDependencies.pluginTrust
         )
     }
 
@@ -527,7 +561,8 @@ final class AppScope {
         discoverDetailService: any DiscoverDetailServing,
         discoverDetailThemeService: any DiscoverDetailThemeServing,
         recentSearchDefaults: UserDefaults = .standard,
-        browsePluginsDirectory: URL? = nil
+        browsePluginsDirectory: URL? = nil,
+        completionRecovery: (any PluginCompletionRecovering)? = nil
     ) -> AppScope {
         AppScope(
             preparedDependencies: .production(
@@ -550,7 +585,8 @@ final class AppScope {
                 discoverDetailService: discoverDetailService,
                 discoverDetailThemeService: discoverDetailThemeService,
                 recentSearchDefaults: recentSearchDefaults,
-                browsePluginsDirectory: browsePluginsDirectory
+                browsePluginsDirectory: browsePluginsDirectory,
+                completionRecovery: completionRecovery
             )
         )
     }

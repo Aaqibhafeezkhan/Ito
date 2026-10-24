@@ -170,6 +170,7 @@ final class BrowseViewModelTests: XCTestCase {
         XCTAssertEqual(files.deleteInvocations, [plugin.url])
         XCTAssertEqual(plugins.reloadCallCount, 1)
         XCTAssertEqual(plugins.removedSecretsPluginIDs, [plugin.id])
+        XCTAssertEqual(plugins.purgedCompletionPluginIDs, [plugin.id])
     }
 
     func testFailedDeletePreservesVisiblePluginAndSurfacesError() async {
@@ -186,6 +187,45 @@ final class BrowseViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.sortedPlugins.map(\.id), [plugin.id])
         XCTAssertEqual(plugins.reloadCallCount, 0)
         XCTAssertTrue(plugins.removedSecretsPluginIDs.isEmpty)
+        // Held progress stays paused and recoverable when the file survives.
+        XCTAssertTrue(plugins.purgedCompletionPluginIDs.isEmpty)
+        XCTAssertEqual(messages.messages, [.deleteFailed(pluginName: "Plugin", reason: "fixture failure")])
+    }
+
+    func testFailedCompletionCancellationKeepsPluginFileAndSecrets() async {
+        let plugin = makePlugin(id: "plugin", name: "Plugin")
+        let plugins = BrowsePluginManagerSpy(installedPlugins: [plugin.id: plugin])
+        plugins.completionHoldError = BrowseTestFailure.failed
+        let files = BrowsePluginFileOperationsSpy()
+        let messages = BrowseMessagePresenterSpy()
+        let viewModel = makeViewModel(plugins: plugins, files: files, messages: messages)
+
+        viewModel.requestDelete(plugin)
+        await viewModel.confirmDelete()
+
+        // Queued progress could still target this source, so nothing may be removed.
+        XCTAssertTrue(files.deleteInvocations.isEmpty)
+        XCTAssertTrue(plugins.removedSecretsPluginIDs.isEmpty)
+        XCTAssertEqual(plugins.reloadCallCount, 0)
+        XCTAssertEqual(messages.messages, [.deleteFailed(pluginName: "Plugin", reason: "fixture failure")])
+    }
+
+    func testFailedTrustRevocationKeepsPluginFileAndSecrets() async {
+        let plugin = makePlugin(id: "plugin", name: "Plugin")
+        let plugins = BrowsePluginManagerSpy(installedPlugins: [plugin.id: plugin])
+        plugins.trustRevocationError = BrowseTestFailure.failed
+        let files = BrowsePluginFileOperationsSpy()
+        let messages = BrowseMessagePresenterSpy()
+        let viewModel = makeViewModel(plugins: plugins, files: files, messages: messages)
+
+        viewModel.requestDelete(plugin)
+        await viewModel.confirmDelete()
+
+        // Pins that could not be deleted must not outlive the file and return with a reinstall.
+        XCTAssertEqual(plugins.revokedTrustPluginIDs, [plugin.id])
+        XCTAssertTrue(files.deleteInvocations.isEmpty)
+        XCTAssertTrue(plugins.removedSecretsPluginIDs.isEmpty)
+        XCTAssertEqual(plugins.reloadCallCount, 0)
         XCTAssertEqual(messages.messages, [.deleteFailed(pluginName: "Plugin", reason: "fixture failure")])
     }
 
@@ -795,6 +835,10 @@ private final class BrowsePluginManagerSpy: BrowsePluginManaging {
     @Published var installedPlugins: [String: InstalledPlugin]
     private(set) var reloadCallCount = 0
     private(set) var removedSecretsPluginIDs: [String] = []
+    var completionHoldError: (any Error)?
+    var trustRevocationError: (any Error)?
+    private(set) var revokedTrustPluginIDs: [String] = []
+    private(set) var purgedCompletionPluginIDs: [String] = []
     var onReload: (() -> Void)?
     var suspendReload = false
     private var reloadContinuation: CheckedContinuation<Void, Never>?
@@ -813,6 +857,19 @@ private final class BrowsePluginManagerSpy: BrowsePluginManaging {
             await withCheckedContinuation { reloadContinuation = $0 }
         }
         onReload?()
+    }
+
+    func holdCompletionDelivery(for pluginID: String) async throws {
+        if let completionHoldError { throw completionHoldError }
+    }
+
+    func purgeCompletionDelivery(for pluginID: String) async {
+        purgedCompletionPluginIDs.append(pluginID)
+    }
+
+    func revokeTrust(for pluginID: String) throws {
+        revokedTrustPluginIDs.append(pluginID)
+        if let trustRevocationError { throw trustRevocationError }
     }
 
     func removeSecrets(for pluginID: String) {

@@ -69,7 +69,10 @@ public final class SearchViewModel: ObservableObject {
             return
         }
 
-        addRecentSearch(trimmed)
+        // Links can carry account or session tokens; only typed searches are remembered.
+        if SearchLink(query: trimmed) == nil {
+            addRecentSearch(trimmed)
+        }
         let initialActivePluginIDs = Set(plugins.map(\.id))
         state = .loading(results: [:], activePluginIDs: initialActivePluginIDs)
 
@@ -178,7 +181,9 @@ public final class SearchViewModel: ObservableObject {
                         pluginID: plugin.id,
                         pluginName: plugin.name,
                         message: pluginError?.message ?? "This source could not be searched.",
-                        canOpenSettings: pluginError?.kind == .needsSettings
+                        canOpenSettings: pluginError?.kind == .needsSettings,
+                        canSignIn: pluginError?.kind == .needsLogin,
+                        pendingTrust: searchExecutor.pendingTrust(for: plugin.id)
                     )
                 )
                 if failure == .pluginTrap {

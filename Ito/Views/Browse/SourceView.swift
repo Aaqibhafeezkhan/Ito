@@ -18,6 +18,7 @@ struct SourceView: View {
     @StateObject private var viewModel: SourceViewModel
     private let viewFactory: AppViewFactory
     @Environment(\.dismiss) private var dismiss
+    @State private var trustAction: TrustCertificateAction?
 
     init(viewModel: SourceViewModel, viewFactory: AppViewFactory) {
         self._viewModel = StateObject(wrappedValue: viewModel)
@@ -45,6 +46,30 @@ struct SourceView: View {
                 } else if let reason = viewModel.settingsUnavailableReason {
                     SourceSettingsUnavailableView(pluginName: viewModel.plugin.info.name, reason: reason)
                 }
+            }
+            .sheet(isPresented: $viewModel.showSignIn, onDismiss: {
+                // Reload the source, and repeat the search if that was what asked for a sign-in.
+                let searchNeededSignIn = viewModel.searchFailureNeedsLogin
+                Task {
+                    await viewModel.retry()
+                    if searchNeededSignIn {
+                        viewModel.performSearch(query: viewModel.searchQuery)
+                    }
+                }
+            }) {
+                if let target = signInTarget {
+                    viewFactory.makePluginSignInSheet(target: target)
+                }
+            }
+            .sheet(item: $trustAction) { action in
+                PluginCertificateConfirmationSheet(
+                    sourceName: action.sourceName,
+                    request: action.request,
+                    onTrust: {
+                        try action.confirm()
+                        action.onSuccess()
+                    }
+                )
             }
             .searchable(
                 text: $viewModel.searchQuery,
@@ -83,7 +108,9 @@ struct SourceView: View {
         case .failure(let error):
             failureView(
                 message: "Error: \(error)",
-                opensSettings: viewModel.failureOffersSettings
+                opensSettings: viewModel.failureOffersSettings,
+                offersSignIn: viewModel.failureNeedsLogin && signInTarget != nil,
+                pendingTrust: viewModel.failurePendingTrust
             ) {
                 Task { await viewModel.retry() }
             }
@@ -385,7 +412,12 @@ struct SourceView: View {
         case .idle, .loading:
             ProgressView("Searching source...")
         case .failure(let error):
-            failureView(message: "Search error: \(error)", opensSettings: viewModel.searchFailureOffersSettings) {
+            failureView(
+                message: "Search error: \(error)",
+                opensSettings: viewModel.searchFailureOffersSettings,
+                offersSignIn: viewModel.searchFailureNeedsLogin && signInTarget != nil,
+                pendingTrust: viewModel.searchFailurePendingTrust
+            ) {
                 viewModel.performSearch(query: viewModel.searchQuery)
             }
         case .cancelled:
@@ -450,10 +482,17 @@ struct SourceView: View {
         }
     }
 
-    /// A failure with Retry, and Open Settings when the plugin needs settings to recover.
+    /// The source's website for signing in, when it has one and sign-in is available.
+    private var signInTarget: PluginSignInTarget? {
+        viewFactory.signInTarget(pluginID: viewModel.plugin.id)
+    }
+
+    /// A failure with Retry, plus Open Settings, Sign In, or Trust Certificate when the source needs one to recover.
     private func failureView(
         message: String,
         opensSettings: Bool = false,
+        offersSignIn: Bool = false,
+        pendingTrust: PendingTrust? = nil,
         retry: @escaping () -> Void
     ) -> some View {
         VStack(spacing: 12) {
@@ -462,6 +501,16 @@ struct SourceView: View {
                 if opensSettings {
                     Button("Open Settings") { viewModel.showSettings = true }
                         .buttonStyle(.borderedProminent)
+                }
+                if offersSignIn {
+                    Button("Sign In") { viewModel.showSignIn = true }
+                        .buttonStyle(.borderedProminent)
+                }
+                if let pendingTrust {
+                    Button("Trust Certificate…") {
+                        trustAction = viewFactory.trustAction(for: pendingTrust, retry: retry)
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
                 Button("Retry", action: retry)
                     .buttonStyle(.bordered)

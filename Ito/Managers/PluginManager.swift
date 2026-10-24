@@ -40,6 +40,7 @@ public class PluginManager: ObservableObject {
         _ settingsStore: PluginSettingsStore
     ) async throws -> ItoRunner
     public let pluginSettingsStore: PluginSettingsStore
+    private weak var completionCoordinator: PluginCompletionCoordinator?
 
     var configuredInstalledPluginsDirectory: URL? {
         pluginsDirectory
@@ -63,6 +64,33 @@ public class PluginManager: ObservableObject {
         self.pluginSettingsStore = pluginSettingsStore
         self.pluginsDirectory = pluginsDirectory
         self.runnerLoader = runnerLoader
+    }
+
+    @MainActor
+    func configureCompletionDelivery(coordinator: PluginCompletionCoordinator) {
+        completionCoordinator = coordinator
+    }
+
+    @MainActor
+    func holdCompletionDelivery(for pluginID: String) async throws {
+        do {
+            try await pluginSettingsStore.completionStore.holdForRemoval(pluginID: pluginID)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw PluginCompletionRecoveryError.queueUnavailable
+        }
+        completionCoordinator?.cancel(for: pluginID)
+    }
+
+    @MainActor
+    func purgeCompletionDelivery(for pluginID: String) async {
+        do {
+            try await pluginSettingsStore.completionStore.purgeRemoved(pluginID: pluginID)
+        } catch {
+            // The held intents stay paused and inert; a reinstall offers them for retry or discard.
+            AppLogger.plugin.error("PluginManager: queued read progress of a removed source could not be cleared")
+        }
     }
 
     /// Gets a cached ItoRunner for a plugin ID, or initializes a new one if not cached.
@@ -124,11 +152,10 @@ public class PluginManager: ObservableObject {
     ) async throws -> (runner: ItoRunner, defaults: AppDefaultsModule) {
         let runner = ItoRunner()
         let defaults = AppDefaultsModule(pluginId: pluginID, store: settingsStore)
-        await runner.setNetModule(AppNetModule())
+        await runner.setNetModule(AppNetModule(pluginID: pluginID, cookieJar: settingsStore.cookies, trust: settingsStore.trust))
         await runner.setStdModule(DefaultStdModule())
         await runner.setDefaultsModule(defaults)
         await runner.setHtmlModule(DefaultHtmlModule())
-        await runner.setJsModule(DefaultJsModule())
         await runner.setWebviewModule(AppWebviewModule())
 
         AppLogger.plugin.debug("\("🔌 [PluginManager] Loading bundle for \(pluginID)")...")
@@ -306,6 +333,10 @@ public class PluginManager: ObservableObject {
         }
         // Also evict ALL runners to pick up updated .ito files
         runnerCache.removeAll()
+        // A source removed in this launch trusts certificates again only once reinstalled.
+        for pluginID in newCache.keys {
+            pluginSettingsStore.trust.activateInstalledPlugin(pluginID)
+        }
         installedPluginsPublicationRevision &+= 1
         AppLogger.plugin.debug(
             "🔌 [PluginManager] Cleared runner cache (\(newCache.count) plugins loaded)"

@@ -59,6 +59,15 @@ nonisolated public final class PluginSettingsStore: ObservableObject, @unchecked
 
     /// Values of the plugins' secret settings, kept in the Keychain rather than this database.
     public let secrets: PluginSecretStore
+    /// Each plugin's website cookies, kept in the Keychain rather than this database.
+    public let cookies: PluginCookieJar
+    /// Credentials plugins obtain themselves (`defaults::set_secret`), kept in the Keychain apart
+    /// from the secrets the user entered. Changing one never rotates image caches or completion
+    /// scopes: plugins refresh tokens routinely.
+    public let tokens: PluginSecretStore
+    /// Server certificates the user trusted for each source's self-hosted servers.
+    public let trust: PluginTrustStore
+    let completionStore: PluginCompletionStore
     private let dbPool: DatabasePool
     private let standardApplicationDomain: String
     private let domainFactory: DomainFactory
@@ -84,7 +93,12 @@ nonisolated public final class PluginSettingsStore: ObservableObject, @unchecked
         faultHandler: @escaping FaultHandler = { _, _ in },
         operationFault: @escaping OperationFault = { _ in },
         clock: @escaping @Sendable () -> Date = Date.init,
-        secrets: PluginSecretStore = PluginSecretStore()
+        secrets: PluginSecretStore = PluginSecretStore(),
+        cookies: PluginCookieJar = PluginCookieJar(),
+        tokens: PluginSecretStore = PluginSecretStore(
+            keychain: SystemPluginSecretKeychain(service: PluginSecretStore.tokenService)
+        ),
+        trust: PluginTrustStore = PluginTrustStore()
     ) {
         self.dbPool = dbPool
         self.standardApplicationDomain = standardApplicationDomain
@@ -93,8 +107,15 @@ nonisolated public final class PluginSettingsStore: ObservableObject, @unchecked
         self.operationFault = operationFault
         self.clock = clock
         self.secrets = secrets
-        secrets.configureBeforeMutation { [dbPool] in
-            try PluginImageCacheEpoch.rotate(in: dbPool)
+        self.cookies = cookies
+        self.tokens = tokens
+        self.trust = trust
+        completionStore = PluginCompletionStore(dbPool: dbPool, secrets: secrets, tokens: tokens)
+        secrets.configureBeforeMutation { [dbPool] pluginID in
+            try dbPool.write { db in
+                try PluginImageCacheEpoch.rotate(in: db)
+                try PluginCompletionScope.rotate(pluginID: pluginID, in: db)
+            }
         }
         dbPool.add(transactionObserver: discoverySources, extent: .observerLifetime)
     }
@@ -242,6 +263,40 @@ nonisolated public final class PluginSettingsStore: ObservableObject, @unchecked
                 throw PluginSettingsReadinessError.unresolvedSuites(unresolved)
             }
         }
+    }
+
+    /// Captures a synchronous in-memory snapshot of settings for a single plugin.
+    /// Lock order is secret lock -> token lock -> DB read. Fails closed if any stored setting has
+    /// invalid UTF-8.
+    func snapshot(pluginId: String) throws -> [String: String] {
+        try secrets.withSnapshot(pluginID: pluginId) { secretValues in
+            try tokens.withSnapshot(pluginID: pluginId) { tokenValues in
+                try dbPool.read { db in
+                    let rows = try PluginSettingRecord.filter(Column("pluginId") == pluginId).fetchAll(db)
+                    return try Self.layeredSettings(rows: rows, tokens: tokenValues, secrets: secretValues)
+                }
+            }
+        }
+    }
+
+    /// What a plugin reads for each key: the user's secret over the plugin's own token over the
+    /// plain value, as `AppDefaultsModule.get` resolves it.
+    nonisolated static func layeredSettings(
+        rows: [PluginSettingRecord],
+        tokens: [String: String],
+        secrets: [String: String]
+    ) throws -> [String: String] {
+        var settings: [String: String] = [:]
+        settings.reserveCapacity(rows.count + tokens.count + secrets.count)
+        for row in rows {
+            guard let value = String(data: row.value, encoding: .utf8) else {
+                throw PluginCompletionScopeError.invalidSettingEncoding
+            }
+            settings[row.key] = value
+        }
+        settings.merge(tokens) { _, token in token }
+        settings.merge(secrets) { _, secret in secret }
+        return settings
     }
 
     public func reload() throws {
