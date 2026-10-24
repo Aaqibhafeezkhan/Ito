@@ -206,7 +206,11 @@ final class MediaDetailProgressFake: MediaDetailProgressServing {
 
     func isRead(media: MediaIdentity, chapterID: String, chapterNumber: Float?) -> Bool {
         readRequests.append(ReadRequest(media: media, chapterID: chapterID, chapterNumber: chapterNumber))
-        return readChapterIDs[media]?.contains(chapterID) == true
+        let hasReadChapterID = readChapterIDs[media]?.contains(chapterID) == true
+        let hasReadChapterNumber = chapterNumber.map {
+            readChapterNumbers[media]?.contains($0) == true
+        } ?? false
+        return hasReadChapterID || hasReadChapterNumber
     }
 
     func lastReadChapter(for media: MediaIdentity) -> String? {
