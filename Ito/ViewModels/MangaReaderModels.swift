@@ -37,6 +37,10 @@ struct MangaScrollRequest: Equatable {
     let pageID: String
     /// Footer page buttons animate; position restores and corrections jump.
     let animated: Bool
+    /// Positions the page at its previous normalized vertical location in the viewport.
+    var alignmentY: CGFloat = 0
+    /// Content mutations first let native anchoring settle; only correct remaining displacement.
+    var waitsForLayout: Bool = false
 }
 
 extension MangaReaderViewModel {
