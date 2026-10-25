@@ -56,9 +56,13 @@ final class SourceViewModel: ObservableObject {
     /// The pending trust for the last search failure, if any.
     @Published private(set) var searchFailurePendingTrust: PendingTrust?
     @Published var showSignIn = false
-    @Published private(set) var searchMangas: [Manga] = []
-    @Published private(set) var searchAnimes: [Anime] = []
-    @Published private(set) var searchNovels: [Novel] = []
+    @Published var selectedKind: MediaKind? {
+        didSet {
+            guard selectedKind != oldValue else { return }
+            scopeDidChange()
+        }
+    }
+    @Published private(set) var searchEntries: [MediaEntry] = []
     @Published var searchQuery = ""
     @Published var showSettings = false
     @Published var showArchivedPluginDeleteConfirmation = false
@@ -119,6 +123,10 @@ final class SourceViewModel: ObservableObject {
         await load(invalidateCachedRunner: true)
     }
 
+    var isMultiKind: Bool {
+        plugin.info.distinctKinds.count > 1
+    }
+
     func performSearch(query: String) {
         cancelSearch(publishCancelledState: false)
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -128,6 +136,7 @@ final class SourceViewModel: ObservableObject {
             return
         }
 
+        let capturedKind = effectiveSearchKind(for: selectedKind)
         let operationID = UUID()
         searchOperationID = operationID
         searchPhase = .loading
@@ -144,9 +153,35 @@ final class SourceViewModel: ObservableObject {
                     return
                 }
             }
-            await executeSearch(query: trimmedQuery, operationID: operationID)
+            await executeSearch(query: trimmedQuery, kind: capturedKind, operationID: operationID)
         }
         searchTask = task
+    }
+
+    private func scopeDidChange() {
+        cancelSearch(publishCancelledState: false)
+        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else {
+            clearSearchResults()
+            searchPhase = .idle
+            return
+        }
+        let capturedKind = effectiveSearchKind(for: selectedKind)
+        let operationID = UUID()
+        searchOperationID = operationID
+        searchPhase = .loading
+        searchFailureNeedsSettings = false
+        searchFailureNeedsLogin = false
+        searchFailurePendingTrust = nil
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await executeSearch(query: trimmedQuery, kind: capturedKind, operationID: operationID)
+        }
+        searchTask = task
+    }
+
+    private func effectiveSearchKind(for kind: MediaKind?) -> MediaKind? {
+        isMultiKind ? kind : kind ?? plugin.info.distinctKinds.first
     }
 
     var hasActiveSearchQuery: Bool {
@@ -188,16 +223,28 @@ final class SourceViewModel: ObservableObject {
         searchFailureNeedsSettings && settingsDestination != nil
     }
 
+    func destination(for entry: MediaEntry) -> SearchDestination? {
+        guard let context else { return nil }
+        switch entry {
+        case .manga(let manga):
+            return .manga(pluginID: plugin.id, context: context, media: manga)
+        case .anime(let anime):
+            return .anime(pluginID: plugin.id, context: context, media: anime)
+        case .novel(let novel):
+            return .novel(pluginID: plugin.id, context: context, media: novel)
+        }
+    }
+
     func destination(for manga: Manga) -> SearchDestination? {
-        context.map { .manga(pluginID: plugin.id, context: $0, media: manga) }
+        destination(for: .manga(manga))
     }
 
     func destination(for anime: Anime) -> SearchDestination? {
-        context.map { .anime(pluginID: plugin.id, context: $0, media: anime) }
+        destination(for: .anime(anime))
     }
 
     func destination(for novel: Novel) -> SearchDestination? {
-        context.map { .novel(pluginID: plugin.id, context: $0, media: novel) }
+        destination(for: .novel(novel))
     }
 
     func requestArchivedPluginDeletion() {
@@ -333,7 +380,7 @@ final class SourceViewModel: ObservableObject {
         }
     }
 
-    private func executeSearch(query: String, operationID: UUID) async {
+    private func executeSearch(query: String, kind: MediaKind?, operationID: UUID) async {
         guard let context = await loadedContext() else {
             guard isCurrentSearch(operationID), !Task.isCancelled else {
                 finishCancelledSearch(operationID)
@@ -354,14 +401,15 @@ final class SourceViewModel: ObservableObject {
         runnerProvider.clearPendingTrust(for: plugin.id)
         do {
             let page = try await context.search(
-                kind: plugin.info.type,
+                kind: kind,
                 query: query,
                 page: 1,
                 filters: []
             )
             try Task.checkCancellation()
             guard isCurrentSearch(operationID) else { return }
-            publishSearchPage(page)
+            // A source may answer a scoped search with other kinds; only the chosen kind is shown.
+            publishSearchPage(kind.map { kind in page.entries.filter { $0.kind == kind } } ?? page.entries)
             finishSearch(operationID)
         } catch is CancellationError {
             finishCancelledSearch(operationID)
@@ -379,19 +427,10 @@ final class SourceViewModel: ObservableObject {
         return context
     }
 
-    private func publishSearchPage(_ page: SourceSearchPage) {
+    private func publishSearchPage(_ entries: [MediaEntry]) {
         clearSearchResults()
-        switch page {
-        case .manga(let mangas):
-            searchMangas = mangas
-            searchPhase = mangas.isEmpty ? .empty : .content
-        case .anime(let animes):
-            searchAnimes = animes
-            searchPhase = animes.isEmpty ? .empty : .content
-        case .novel(let novels):
-            searchNovels = novels
-            searchPhase = novels.isEmpty ? .empty : .content
-        }
+        searchEntries = entries
+        searchPhase = entries.isEmpty ? .empty : .content
     }
 
     private func publishSearchFailure(_ error: any Error, operationID: UUID) {
@@ -460,9 +499,7 @@ final class SourceViewModel: ObservableObject {
     }
 
     private func clearSearchResults() {
-        searchMangas = []
-        searchAnimes = []
-        searchNovels = []
+        searchEntries = []
     }
 
     private func cancelLoad(publishCancelledState: Bool) {

@@ -122,6 +122,8 @@ public struct SourceMatchIdentity: Hashable, Sendable {
             mediaKind = "manga"
         case .anime:
             mediaKind = "anime"
+        case .novel:
+            mediaKind = "novel"
         }
     }
 }
@@ -171,7 +173,15 @@ public final class SourceResolverViewModel: ObservableObject {
 
     var canonicalProvider: String { "anilist" }
     private var canonicalMediaId: String { String(media.id) }
-    private var canonicalMediaType: PluginMediaType { media.type == "ANIME" ? .anime : .manga }
+    private var canonicalMediaType: PluginMediaType {
+        if media.type == "ANIME" {
+            return .anime
+        }
+        if media.format?.uppercased() == "NOVEL" {
+            return .novel
+        }
+        return .manga
+    }
 
     init(
         media: DiscoverMedia,
@@ -254,13 +264,11 @@ public final class SourceResolverViewModel: ObservableObject {
     private func linkAniListIfNeeded(items: [LibraryItem]) {
         guard let route = sourceRoute,
               let anilistID = route.anilistID else { return }
-        let itemKey = route.media.key()
-        let mediaKind: MediaKind
-        switch route.media {
-        case .manga: mediaKind = .manga
-        case .anime: mediaKind = .anime
-        }
-        let mediaIdentity = MediaIdentity(pluginId: route.pluginID, canonicalMediaId: itemKey, mediaKind: mediaKind)
+        let mediaIdentity = MediaIdentity(
+            pluginId: route.pluginID,
+            canonicalMediaId: route.media.key(),
+            mediaKind: route.media.mediaType.mediaKind
+        )
         guard items.contains(where: { $0.mediaIdentity == mediaIdentity }) else { return }
         guard trackerLinker.anilistTrackerID(for: mediaIdentity) == nil,
               linkingMediaIdentity != mediaIdentity else { return }
@@ -474,8 +482,7 @@ public final class SourceResolverViewModel: ObservableObject {
 
         do {
             let matchingPlugins = pluginProvider.installedPlugins.values.filter {
-                if request.mediaType == .anime { return $0.info.type == .anime }
-                return $0.info.type == .manga
+                $0.info.supportedKinds.contains(request.mediaType.mediaKind)
             }
             guard !matchingPlugins.isEmpty else {
                 guard isCurrent() else { return }
@@ -617,14 +624,8 @@ public final class SourceResolverViewModel: ObservableObject {
                 continue
             }
 
-            let decodedType: PluginMediaType
-            switch decoded.payload {
-            case .anime:
-                decodedType = .anime
-            case .manga:
-                decodedType = .manga
-            }
-            guard decodedType == canonicalMediaType else { continue }
+            guard decoded.payload.mediaType == canonicalMediaType else { continue }
+            guard plugin.info.supportedKinds.contains(canonicalMediaType.mediaKind) else { continue }
 
             if let storedVersion = mapping.pluginVersion,
                plugin.info.version != storedVersion {
@@ -860,19 +861,9 @@ public final class SourceResolverViewModel: ObservableObject {
         let snapshot = SourceMediaSnapshot(version: 1, payload: match.media)
         let payload = try JSONEncoder().encode(snapshot)
 
-        let mediaKey: String
-        let title: String
-        let coverURL: String?
-        switch match.media {
-        case .manga(let manga):
-            mediaKey = manga.key
-            title = manga.title
-            coverURL = manga.cover
-        case .anime(let anime):
-            mediaKey = anime.key
-            title = anime.title
-            coverURL = anime.cover
-        }
+        let mediaKey = match.media.key()
+        let title = match.media.title()
+        let coverURL = match.media.cover()
 
         let now = Date()
         let record = SourceMappingRecord(
@@ -969,17 +960,6 @@ public final class SourceResolverViewModel: ObservableObject {
         isSearching = false
         if case .loading(let matches) = state, !matches.isEmpty {
             state = .completed(matches: matches)
-        }
-    }
-}
-
-public extension ResolvedPluginMedia {
-    func key() -> String {
-        switch self {
-        case .manga(let manga):
-            return manga.key
-        case .anime(let anime):
-            return anime.key
         }
     }
 }
