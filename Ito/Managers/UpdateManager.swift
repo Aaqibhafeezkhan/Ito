@@ -395,7 +395,7 @@ public class UpdateManager: ObservableObject {
             return nil
         }
         do {
-            let media = MediaIdentity(pluginId: item.pluginId, itemId: item.id)
+            let media = item.mediaIdentity
             let committed = try await dbPool.write { db -> (
                 oldCount: Int?,
                 delta: Int,
@@ -405,6 +405,7 @@ public class UpdateManager: ObservableObject {
                 let badge = UpdateBadgeRecord
                     .filter(Column("pluginId") == media.pluginId)
                     .filter(Column("canonicalMediaId") == media.canonicalMediaId)
+                    .filter(Column("mediaKind") == media.mediaKind.rawValue)
                 guard var dbItem = try LibraryItem.fetchOne(db, key: item.id) else {
                     _ = try LibraryItem.deleteOne(db, key: item.id)
                     try badge.deleteAll(db)
@@ -428,6 +429,7 @@ public class UpdateManager: ObservableObject {
                     try UpdateBadgeRecord(
                         pluginId: media.pluginId,
                         canonicalMediaId: media.canonicalMediaId,
+                        mediaKind: media.mediaKind,
                         count: unread,
                         updatedAt: checkedAt,
                         provenance: .runtime
@@ -478,19 +480,25 @@ public class UpdateManager: ObservableObject {
         newChapterCounts.values.reduce(0, +)
     }
 
-    public func advanceBaseline(
-        for itemId: String,
-        media: MediaIdentity,
-        knownChapterCount: Int
-    ) async throws {
+    public func advanceBaseline(media: MediaIdentity, knownChapterCount: Int) async throws {
         try await dbPool.write { db in
-            if var item = try LibraryItem.fetchOne(db, key: itemId) {
+            let candidateIDs = ImportedMediaIdentity.localItemIDs(
+                pluginId: media.pluginId,
+                canonicalMediaId: media.canonicalMediaId,
+                mediaKind: media.mediaKind
+            )
+            for id in candidateIDs {
+                guard var item = try LibraryItem.fetchOne(db, key: id),
+                      item.pluginId == media.pluginId,
+                      item.effectiveType == media.mediaKind else { continue }
                 item.knownChapterCount = knownChapterCount
                 try item.update(db)
+                break
             }
             try UpdateBadgeRecord
                 .filter(Column("pluginId") == media.pluginId)
                 .filter(Column("canonicalMediaId") == media.canonicalMediaId)
+                .filter(Column("mediaKind") == media.mediaKind.rawValue)
                 .deleteAll(db)
         }
         newChapterCounts.removeValue(forKey: media)
@@ -501,6 +509,7 @@ public class UpdateManager: ObservableObject {
             try UpdateBadgeRecord
                 .filter(Column("pluginId") == media.pluginId)
                 .filter(Column("canonicalMediaId") == media.canonicalMediaId)
+                .filter(Column("mediaKind") == media.mediaKind.rawValue)
                 .deleteAll(db)
         }
         newChapterCounts.removeValue(forKey: media)
@@ -519,13 +528,16 @@ public class UpdateManager: ObservableObject {
         let (records, libraryItems) = try await dbPool.read { db in
             (
                 try UpdateBadgeRecord.fetchAll(db),
-                try Row.fetchAll(db, sql: "SELECT pluginId, id FROM libraryItem")
-                    .map { (pluginId: $0["pluginId"] as String, itemId: $0["id"] as String) }
+                try LibraryItem.fetchAll(db)
             )
         }
-        let library = Set(libraryItems.map { MediaIdentity(pluginId: $0.pluginId, itemId: $0.itemId) })
+        let library = Set(libraryItems.map(\.mediaIdentity))
         newChapterCounts = Dictionary(uniqueKeysWithValues: records.compactMap { record in
-            let media = MediaIdentity(pluginId: record.pluginId, canonicalMediaId: record.canonicalMediaId)
+            let media = MediaIdentity(
+                pluginId: record.pluginId,
+                canonicalMediaId: record.canonicalMediaId,
+                mediaKind: record.mediaKind
+            )
             return library.contains(media) ? (media, max(0, record.count)) : nil
         })
     }

@@ -22,6 +22,7 @@ struct BackupRestoreOperationPhaseTests {
             title: "History",
             coverUrl: nil,
             pluginId: localItem.pluginId,
+            mediaKind: localItem.effectiveType,
             chapterKey: "chapter",
             chapterTitle: nil
         )
@@ -91,10 +92,8 @@ struct BackupRestoreOperationPhaseTests {
         )
     }
 
-    @Test(arguments: [BackupRestoreMode.wipe, .merge])
-    func reusedLibraryRowIdDoesNotCrossAttachRetainedHistory(
-        mode: BackupRestoreMode
-    ) async throws {
+    @Test func wipeRestoringAnotherSeriesUnderAReusedRowIdDoesNotCrossAttachRetainedHistory() async throws {
+        let mode = BackupRestoreMode.wipe
         let database = try TestDatabase()
         defer { database.cleanup() }
         let reusedId = "old_media"
@@ -110,6 +109,7 @@ struct BackupRestoreOperationPhaseTests {
             title: "Retained History",
             coverUrl: "https://old.example/cover.jpg",
             pluginId: localItem.pluginId,
+            mediaKind: localItem.effectiveType,
             chapterKey: "chapter-7",
             chapterTitle: "Chapter Seven"
         )
@@ -158,6 +158,44 @@ struct BackupRestoreOperationPhaseTests {
         #expect(state.1?.pluginId != retainedHistory.pluginId)
     }
 
+    @Test(arguments: [ConflictResolution?.none, .keepBackup])
+    func mergeKeepsBothSeriesWhenABackupSeriesReusesALocalRowId(resolution: ConflictResolution?) async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let reusedId = "old_media"
+        let localItem = item(id: reusedId, title: "Local", pluginId: "old")
+        let history = ReadingHistoryRecord(
+            id: "retained-history",
+            libraryItemId: reusedId,
+            mediaKey: reusedId,
+            title: "Retained History",
+            coverUrl: nil,
+            pluginId: localItem.pluginId,
+            mediaKind: localItem.effectiveType,
+            chapterKey: "chapter-7",
+            chapterTitle: nil
+        )
+        try await database.dbPool.write { db in
+            try localItem.insert(db)
+            try history.insert(db)
+        }
+        let replacement = item(id: reusedId, title: "Replacement", pluginId: "new")
+
+        let report = try await operation(database).restore(
+            representedBackup(components: [.libraryCore], items: [replacement]),
+            mode: .merge,
+            operationId: "reused-id-merge",
+            resolvedConflicts: resolution.map { [reusedId: $0] } ?? [:]
+        )
+
+        #expect(report.outcomes.first { $0.component == .libraryCore }?.inserted == 1)
+        try await database.dbPool.read { db throws in
+            #expect(try LibraryItem.fetchOne(db, key: reusedId) == localItem)
+            #expect(try LibraryItem.fetchOne(db, key: "new_old_media")?.title == "Replacement")
+            #expect(try ReadingHistoryRecord.fetchOne(db, key: history.id)?.libraryItemId == reusedId)
+        }
+    }
+
     @Test func mergeIsLocalWinsWithDeterministicCounts() async throws {
         let database = try TestDatabase()
         defer { database.cleanup() }
@@ -169,6 +207,7 @@ struct BackupRestoreOperationPhaseTests {
         let localBadge = UpdateBadgeRecord(
             pluginId: "plugin",
             canonicalMediaId: "media",
+            mediaKind: .manga,
             count: 4,
             updatedAt: Date(timeIntervalSince1970: 1),
             provenance: .runtime
@@ -183,6 +222,7 @@ struct BackupRestoreOperationPhaseTests {
                 UpdateBadgeRecord(
                     pluginId: "plugin",
                     canonicalMediaId: "media",
+                    mediaKind: .manga,
                     count: 9,
                     updatedAt: Date(timeIntervalSince1970: 2),
                     provenance: .runtime
@@ -190,6 +230,7 @@ struct BackupRestoreOperationPhaseTests {
                 UpdateBadgeRecord(
                     pluginId: "plugin",
                     canonicalMediaId: "new",
+                    mediaKind: .manga,
                     count: 1,
                     updatedAt: nil,
                     provenance: .runtime
@@ -223,8 +264,8 @@ struct BackupRestoreOperationPhaseTests {
         let mergedState = try await database.dbPool.read { db in
             (
                 try UpdateBadgeRecord.fetchOne(
-                db,
-                key: ["pluginId": "plugin", "canonicalMediaId": "media"]
+                    db,
+                    key: ["pluginId": "plugin", "canonicalMediaId": "media", "mediaKind": MediaKind.manga.rawValue]
                 ),
                 try RepositoryRecord.fetchOne(
                     db,
@@ -263,6 +304,7 @@ struct BackupRestoreOperationPhaseTests {
                     title: "Backup",
                     coverUrl: nil,
                     pluginId: imported.pluginId,
+                    mediaKind: imported.effectiveType,
                     chapterKey: "backup",
                     chapterTitle: nil
                 )
@@ -498,6 +540,7 @@ struct BackupRestoreOperationPhaseTests {
                 MediaReadProgressRecord(
                     pluginId: "plugin",
                     canonicalMediaId: "series",
+                    mediaKind: .manga,
                     lastReadChapterKey: "chapter-4",
                     updatedAt: Date(timeIntervalSince1970: 2),
                     provenance: .runtime,
@@ -746,6 +789,7 @@ struct BackupRestoreOperationPhaseTests {
                     title: "History",
                     coverUrl: nil,
                     pluginId: imported.pluginId,
+                    mediaKind: imported.effectiveType,
                     chapterKey: "chapter",
                     chapterTitle: nil
                 )
@@ -754,6 +798,7 @@ struct BackupRestoreOperationPhaseTests {
                 TrackerLinkRecord(
                     pluginId: "plugin",
                     canonicalMediaId: "media",
+                    mediaKind: .manga,
                     providerId: "anilist",
                     remoteMediaId: "42",
                     updatedAt: nil,
@@ -781,6 +826,7 @@ struct BackupRestoreOperationPhaseTests {
                 key: [
                     "pluginId": "plugin",
                     "canonicalMediaId": "media",
+                    "mediaKind": MediaKind.manga.rawValue,
                     "providerId": "anilist"
                 ]
                 )
@@ -811,10 +857,38 @@ struct BackupRestoreOperationPhaseTests {
                 key: [
                     "pluginId": "plugin",
                     "canonicalMediaId": "media",
+                    "mediaKind": MediaKind.manga.rawValue,
                     "providerId": "anilist"
                 ]
             )?.remoteMediaId == "73"
         })
+    }
+
+    @Test(arguments: [ConflictResolution?.none, .keepBackup])
+    func backupItemOfAnotherKindUnderTheLocalItemsIdIsRestoredBesideIt(
+        resolution: ConflictResolution?
+    ) async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+        let localManga = item(id: "media", title: "Manga")
+        try await database.dbPool.write { db in try localManga.insert(db) }
+        var backupNovel = item(id: "media", title: "Novel")
+        backupNovel.pluginType = .novel
+
+        let report = try await operation(database).restore(
+            representedBackup(components: [.libraryCore], items: [backupNovel]),
+            mode: .merge,
+            operationId: "same-id-other-kind",
+            resolvedConflicts: resolution.map { ["media": $0] } ?? [:]
+        )
+
+        #expect(report.outcomes.first { $0.component == .libraryCore }?.inserted == 1)
+        try await database.dbPool.read { db in
+            #expect(try LibraryItem.fetchOne(db, key: "media") == localManga)
+            let restored = try #require(try LibraryItem.fetchOne(db, key: "plugin\u{1F}novel\u{1F}media"))
+            #expect(restored.title == "Novel")
+            #expect(restored.effectiveType == .novel)
+        }
     }
 
     @Test func sourceAwareArchivesAreIdempotentAndKeepDistinctSources() async throws {
@@ -989,6 +1063,7 @@ struct BackupRestoreOperationPhaseTests {
                 title: "Local",
                 coverUrl: nil,
                 pluginId: "plugin",
+                mediaKind: .manga,
                 chapterKey: "local",
                 chapterTitle: nil
             ).insert(db)

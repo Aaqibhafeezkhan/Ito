@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import GRDB
+import ito_runner
 import OSLog
 import SystemConfiguration
 
@@ -14,6 +15,7 @@ nonisolated enum BackupMergeError: Error, Equatable {
         itemId: String,
         categoryId: String
     )
+    case noFreeLibraryID(pluginId: String, canonicalMediaId: String)
 }
 
 nonisolated struct BackupMergeResult: Sendable, Equatable {
@@ -57,7 +59,11 @@ nonisolated struct BackupMergeOperation: Sendable {
 
             for (index, disposition) in dispositions.enumerated() {
                 let item = disposition.importedItem
-                let key = ImportedMediaIdentity.key(itemId: item.id, pluginId: item.pluginId)
+                let key = ImportedMediaIdentity.key(
+                    itemId: item.id,
+                    pluginId: item.pluginId,
+                    mediaKind: item.effectiveType
+                )
                 direct[item.id, default: []].append(index)
                 canonical[key, default: []].append(index)
                 for alias in Set([item.id, key.canonicalMediaId, "\(item.pluginId)_\(key.canonicalMediaId)"]) {
@@ -81,7 +87,11 @@ nonisolated struct BackupMergeOperation: Sendable {
         func disposition(for history: ReadingHistoryRecord) -> ItemDisposition? {
             var matches = Set<Int>()
             for identifier in [history.libraryItemId, history.mediaKey].compactMap({ $0 }) {
-                let key = ImportedMediaIdentity.key(itemId: identifier, pluginId: history.pluginId)
+                let key = ImportedMediaIdentity.key(
+                    itemId: identifier,
+                    pluginId: history.pluginId,
+                    mediaKind: history.mediaKind
+                )
                 matches.formUnion(canonical[key] ?? [])
             }
             guard matches.count == 1, let match = matches.first else { return nil }
@@ -94,7 +104,7 @@ nonisolated struct BackupMergeOperation: Sendable {
 
         init(_ items: [LibraryItem]) {
             itemsByIdentity = Dictionary(grouping: items) {
-                ImportedMediaIdentity.key(itemId: $0.id, pluginId: $0.pluginId)
+                ImportedMediaIdentity.key(itemId: $0.id, pluginId: $0.pluginId, mediaKind: $0.effectiveType)
             }
         }
 
@@ -102,7 +112,11 @@ nonisolated struct BackupMergeOperation: Sendable {
             var itemIds = Set<String>()
             var identityByItemId: [String: ImportedMediaIdentity.Key] = [:]
             for identifier in [history.libraryItemId, history.mediaKey].compactMap({ $0 }) {
-                let key = ImportedMediaIdentity.key(itemId: identifier, pluginId: history.pluginId)
+                let key = ImportedMediaIdentity.key(
+                    itemId: identifier,
+                    pluginId: history.pluginId,
+                    mediaKind: history.mediaKind
+                )
                 for item in itemsByIdentity[key] ?? [] {
                     itemIds.insert(item.id)
                     identityByItemId[item.id] = key
@@ -269,7 +283,11 @@ nonisolated struct BackupMergeOperation: Sendable {
             let localItemIdentityIndex = LibraryItemIdentityIndex(localItems)
             var semanticKeys = Set(persistedHistory.map { history in
                 let identity = localItemIdentityIndex.uniqueIdentity(for: history)
-                    ?? ImportedMediaIdentity.key(itemId: history.mediaKey, pluginId: history.pluginId)
+                    ?? ImportedMediaIdentity.key(
+                        itemId: history.mediaKey,
+                        pluginId: history.pluginId,
+                        mediaKind: history.mediaKind
+                    )
                 return HistorySemanticKey(
                     mediaIdentity: identity,
                     chapterKey: history.chapterKey,
@@ -305,7 +323,8 @@ nonisolated struct BackupMergeOperation: Sendable {
                 let semanticKey = HistorySemanticKey(
                     mediaIdentity: ImportedMediaIdentity.key(
                         itemId: disposition.importedItem.id,
-                        pluginId: disposition.importedItem.pluginId
+                        pluginId: disposition.importedItem.pluginId,
+                        mediaKind: disposition.importedItem.effectiveType
                     ),
                     chapterKey: history.chapterKey,
                     readAt: history.readAt
@@ -351,12 +370,18 @@ nonisolated struct BackupMergeOperation: Sendable {
         localItems: [LibraryItem]
     ) throws -> [ItemDisposition] {
         let localIndex = Dictionary(grouping: localItems) {
-            ImportedMediaIdentity.key(itemId: $0.id, pluginId: $0.pluginId)
+            ImportedMediaIdentity.key(itemId: $0.id, pluginId: $0.pluginId, mediaKind: $0.effectiveType)
         }
+        // Ids already taken, so a new item never lands on (and replaces) a different series.
+        var occupants = Dictionary(
+            localItems.map { ($0.id, (pluginId: $0.pluginId, mediaKind: $0.effectiveType)) },
+            uniquingKeysWith: { first, _ in first }
+        )
         return try importedItems.map { importedItem in
             let identity = ImportedMediaIdentity.key(
                 itemId: importedItem.id,
-                pluginId: importedItem.pluginId
+                pluginId: importedItem.pluginId,
+                mediaKind: importedItem.effectiveType
             )
             let matches = localIndex[identity] ?? []
             guard matches.count <= 1 else {
@@ -366,11 +391,23 @@ nonisolated struct BackupMergeOperation: Sendable {
                     localItemIds: matches.map(\.id).sorted()
                 )
             }
-            return ItemDisposition(
-                importedItem: importedItem,
-                targetId: matches.first?.id ?? importedItem.id,
-                isPreexisting: !matches.isEmpty
-            )
+            if let match = matches.first {
+                return ItemDisposition(importedItem: importedItem, targetId: match.id, isPreexisting: true)
+            }
+            guard let targetId = ImportedMediaIdentity.newItemID(
+                preferred: importedItem.id,
+                pluginId: identity.pluginId,
+                canonicalMediaId: identity.canonicalMediaId,
+                mediaKind: identity.mediaKind,
+                occupant: { occupants[$0] }
+            ) else {
+                throw BackupMergeError.noFreeLibraryID(
+                    pluginId: identity.pluginId,
+                    canonicalMediaId: identity.canonicalMediaId
+                )
+            }
+            occupants[targetId] = (pluginId: identity.pluginId, mediaKind: identity.mediaKind)
+            return ItemDisposition(importedItem: importedItem, targetId: targetId, isPreexisting: false)
         }
     }
 

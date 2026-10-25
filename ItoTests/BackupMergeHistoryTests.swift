@@ -543,6 +543,79 @@ struct BackupMergeHistoryTests {
         }
     }
 
+    @Test func backupItemOfAnotherKindSavedUnderTheLocalItemsIdMergesBesideIt() async throws {
+        let database = try TestDatabase()
+        defer { database.cleanup() }
+
+        // Each device saved its series under the bare key, as LibraryManager does.
+        let mangaItem = LibraryItem(
+            id: "42",
+            title: "Manga 42",
+            coverUrl: nil,
+            pluginId: "test.plugin",
+            isAnime: false,
+            pluginType: .manga,
+            rawPayload: Data([1]),
+            anilistId: nil
+        )
+        let novelItem = LibraryItem(
+            id: "42",
+            title: "Novel 42",
+            coverUrl: nil,
+            pluginId: "test.plugin",
+            isAnime: false,
+            pluginType: .novel,
+            rawPayload: Data([2]),
+            anilistId: nil
+        )
+
+        let mangaHistory = makeHistory(
+            id: "manga-history",
+            itemId: mangaItem.id,
+            chapter: "ch-1",
+            mediaKind: .manga
+        )
+        let novelHistory = makeHistory(
+            id: "novel-history",
+            itemId: novelItem.id,
+            chapter: "ch-1",
+            mediaKind: .novel
+        )
+
+        try await database.dbPool.write { db in
+            try mangaItem.insert(db)
+            try mangaHistory.insert(db)
+        }
+
+        let backup = ImportedBackup(
+            categories: [],
+            items: [novelItem],
+            links: [],
+            history: [novelHistory]
+        )
+
+        let result = try await operation(database).restore(backup, mode: .merge)
+        #expect(result.insertedItemCount == 1)
+        #expect(result.insertedHistoryCount == 1)
+        #expect(result.skippedDuplicateHistoryCount == 0)
+
+        let novelTargetID = "test.plugin\u{1F}novel\u{1F}42"
+        try await database.dbPool.read { db in
+            #expect(try LibraryItem.fetchOne(db, key: "42") == mangaItem)
+            let mergedNovel = try #require(try LibraryItem.fetchOne(db, key: novelTargetID))
+            #expect(mergedNovel.title == novelItem.title)
+            #expect(mergedNovel.effectiveType == .novel)
+            #expect(try LibraryItem.fetchCount(db) == 2)
+
+            let histories = try ReadingHistoryRecord.fetchAll(db)
+            #expect(histories.count == 2)
+            #expect(try ReadingHistoryRecord.fetchOne(db, key: "manga-history") == mangaHistory)
+            let mergedHistory = try #require(try ReadingHistoryRecord.fetchOne(db, key: "novel-history"))
+            #expect(mergedHistory.libraryItemId == novelTargetID)
+            #expect(mergedHistory.mediaKind == .novel)
+        }
+    }
+
     private func operation(_ database: TestDatabase) -> BackupMergeOperation {
         BackupMergeOperation(dbPool: database.dbPool)
     }
@@ -564,6 +637,7 @@ struct BackupMergeHistoryTests {
         id: String,
         itemId: String,
         chapter: String,
+        mediaKind: MediaKind = .manga,
         readAt: Date = Date(timeIntervalSince1970: 1_700_000_000)
     ) -> ReadingHistoryRecord {
         ReadingHistoryRecord(
@@ -573,6 +647,7 @@ struct BackupMergeHistoryTests {
             title: "History",
             coverUrl: nil,
             pluginId: "test.plugin",
+            mediaKind: mediaKind,
             chapterKey: chapter,
             chapterTitle: chapter,
             readAt: readAt

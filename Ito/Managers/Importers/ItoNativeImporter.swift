@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import ito_runner
 
 public struct ItoNativeImporter: BackupImporter {
     nonisolated private static let legacyRepositoriesKey = "ito_repositories"
@@ -21,7 +22,7 @@ public struct ItoNativeImporter: BackupImporter {
 
         return try await backupPool.read { db in
             let metadata = try fetchMetadata(in: db)
-            let capabilities = try fetchCapabilities(in: db)
+            var capabilities = try fetchCapabilities(in: db)
             let hasLegacyLibraryTables = try [
                 LibraryCategory.databaseTableName,
                 LibraryItem.databaseTableName,
@@ -33,7 +34,41 @@ public struct ItoNativeImporter: BackupImporter {
             let categories = try fetchIfPresent(LibraryCategory.self, in: db)
             let items = try fetchLibraryItems(in: db)
             let links = try fetchIfPresent(ItemCategoryLink.self, in: db)
-            let history = try fetchIfPresent(ReadingHistoryRecord.self, in: db)
+            var legacyStateArchives = try fetchArchives(in: db)
+            let capturedAt = metadata?.createdAt ?? Date()
+            let resolver = try LegacyMediaKindResolver(db: db)
+            func stateRows<Record: FetchableRecord & TableRecord>(
+                _ type: Record.Type,
+                _ component: BackupComponent,
+                rowCode: String
+            ) throws -> [Record] {
+                try fetchKindScoped(
+                    type,
+                    component: component,
+                    rowCode: rowCode,
+                    identityColumns: ["pluginId", "canonicalMediaId"],
+                    resolveKind: { row in
+                        guard let pluginId: String = LegacyMediaKindResolver.value(row, "pluginId"),
+                              let mediaId: String = LegacyMediaKindResolver.value(row, "canonicalMediaId") else {
+                            return nil
+                        }
+                        return resolver.resolve(pluginID: pluginId, canonicalMediaID: mediaId)
+                    },
+                    capturedAt: capturedAt,
+                    archives: &legacyStateArchives,
+                    in: db
+                )
+            }
+            let history = try fetchKindScoped(
+                ReadingHistoryRecord.self,
+                component: .readingHistory,
+                rowCode: "invalidReadingHistoryRow",
+                identityColumns: ["id", "pluginId", "mediaKey"],
+                resolveKind: resolver.resolveHistory,
+                capturedAt: capturedAt,
+                archives: &legacyStateArchives,
+                in: db
+            )
             let sourceMappings = try capabilities.contains {
                 $0.component == .sourceMappings
                     && $0.representation != .unrepresented
@@ -41,14 +76,18 @@ public struct ItoNativeImporter: BackupImporter {
                 ? fetchSourceMappings(in: db)
                 : []
             let preferences = try fetchIfPresent(AppPreference.self, in: db)
-            let readProgressKeys = try fetchIfPresent(ReadProgressKeyRecord.self, in: db)
-            let readProgressNumbers = try fetchIfPresent(
-                ReadProgressNumberRecord.self,
-                in: db
+            let readProgressKeys = try stateRows(
+                ReadProgressKeyRecord.self, .readProgressAndResume, rowCode: "invalidReadProgressKeyRow"
             )
-            let mediaReadProgress = try fetchIfPresent(MediaReadProgressRecord.self, in: db)
-            var trackerLinks = try fetchIfPresent(TrackerLinkRecord.self, in: db)
-            let updateBadges = try fetchIfPresent(UpdateBadgeRecord.self, in: db)
+            let readProgressNumbers = try stateRows(
+                ReadProgressNumberRecord.self, .readProgressAndResume, rowCode: "invalidReadProgressNumberRow"
+            )
+            let mediaReadProgress = try stateRows(
+                MediaReadProgressRecord.self, .readProgressAndResume, rowCode: "invalidMediaReadProgressRow"
+            )
+            var trackerLinks = try stateRows(TrackerLinkRecord.self, .trackerLinks, rowCode: "invalidTrackerLinkRow")
+            let updateBadges = try stateRows(UpdateBadgeRecord.self, .updateBadges, rowCode: "invalidUpdateBadgeRow")
+            legacyStateArchives = Self.uniqueArchives(legacyStateArchives)
             var repositories = try fetchIfPresent(RepositoryRecord.self, in: db)
             let importerAliases = try fetchIfPresent(
                 PluginMigrationAliasRecord.self,
@@ -64,7 +103,6 @@ public struct ItoNativeImporter: BackupImporter {
                 LegacyUnscopedMediaStateRecord.self,
                 in: db
             )
-            let legacyStateArchives = try fetchArchives(in: db)
             var importedPreferences = preferences
             var legacyRepresentationOverrides: [BackupComponent: BackupRepresentation] = [:]
 
@@ -91,7 +129,47 @@ public struct ItoNativeImporter: BackupImporter {
                         hasRows: !history.isEmpty
                     )
                 }
+                if try db.tableExists(LegacyStateArchiveRecord.databaseTableName) || !legacyStateArchives.isEmpty {
+                    legacyRepresentationOverrides[.legacyStateArchive] = representation(
+                        hasRows: !legacyStateArchives.isEmpty
+                    )
+                }
                 importedPreferences.removeAll { $0.key == Self.legacyRepositoriesKey }
+            } else if !capabilities.isEmpty {
+                capabilities = capabilities.map { cap in
+                    switch cap.component {
+                    case .legacyStateArchive:
+                        if !legacyStateArchives.isEmpty && cap.representation != .representedNonempty {
+                            return BackupCapabilityRecord(component: .legacyStateArchive, representation: .representedNonempty)
+                        }
+                    case .readProgressAndResume:
+                        let hasRows = !readProgressKeys.isEmpty || !readProgressNumbers.isEmpty || !mediaReadProgress.isEmpty
+                        if !hasRows && cap.representation == .representedNonempty {
+                            return BackupCapabilityRecord(component: .readProgressAndResume, representation: .representedEmpty)
+                        }
+                    case .readingHistory:
+                        if history.isEmpty && cap.representation == .representedNonempty {
+                            return BackupCapabilityRecord(component: .readingHistory, representation: .representedEmpty)
+                        }
+                    case .trackerLinks:
+                        if trackerLinks.isEmpty && cap.representation == .representedNonempty {
+                            return BackupCapabilityRecord(component: .trackerLinks, representation: .representedEmpty)
+                        }
+                    case .updateBadges:
+                        if updateBadges.isEmpty && cap.representation == .representedNonempty {
+                            return BackupCapabilityRecord(component: .updateBadges, representation: .representedEmpty)
+                        }
+                    default:
+                        break
+                    }
+                    return cap
+                }
+                if !legacyStateArchives.isEmpty,
+                   !capabilities.contains(where: { $0.component == .legacyStateArchive }) {
+                    capabilities.append(
+                        BackupCapabilityRecord(component: .legacyStateArchive, representation: .representedNonempty)
+                    )
+                }
             }
 
             let imported = ImportedBackup(
@@ -245,6 +323,13 @@ public struct ItoNativeImporter: BackupImporter {
                     throw invalidArchiveClassification()
                 }
             case .opaquePluginState:
+                // Rows archived for lacking a provable kind are app state from the six kind-scoped tables.
+                if archive.reason == "kindUnknown",
+                   archive.contentClass == .appNonSecret,
+                   archive.valueType == "databaseRow",
+                   LegacyMediaKindResolver.kindScopedTables.contains(archive.sourceDomain) {
+                    break
+                }
                 guard archive.contentClass == .opaquePluginState else {
                     throw invalidArchiveClassification()
                 }
@@ -274,20 +359,22 @@ public struct ItoNativeImporter: BackupImporter {
     ) -> [TrackerLinkRecord] {
         var links = existingLinks
         var representedKeys = Set(
-            links.map { "\($0.pluginId)\u{0}\($0.canonicalMediaId)\u{0}\($0.providerId)" }
+            links.map { "\($0.pluginId)\u{0}\($0.canonicalMediaId)\u{0}\($0.mediaKind.rawValue)\u{0}\($0.providerId)" }
         )
         for item in items {
             guard let anilistId = item.anilistId else { continue }
             let canonicalMediaId = ImportedMediaIdentity.canonicalMediaId(
                 itemId: item.id,
-                pluginId: item.pluginId
+                pluginId: item.pluginId,
+                mediaKind: item.effectiveType
             )
-            let key = "\(item.pluginId)\u{0}\(canonicalMediaId)\u{0}anilist"
+            let key = "\(item.pluginId)\u{0}\(canonicalMediaId)\u{0}\(item.effectiveType.rawValue)\u{0}anilist"
             guard representedKeys.insert(key).inserted else { continue }
             links.append(
                 TrackerLinkRecord(
                     pluginId: item.pluginId,
                     canonicalMediaId: canonicalMediaId,
+                    mediaKind: item.effectiveType,
                     providerId: "anilist",
                     remoteMediaId: String(anilistId),
                     updatedAt: nil,
@@ -296,6 +383,67 @@ public struct ItoNativeImporter: BackupImporter {
             )
         }
         return links
+    }
+
+    /// Reads one kind-scoped table. Rows with a `mediaKind` column decode as stored. Older kindless rows take the
+    /// kind `resolveKind` proves and are otherwise archived unchanged. A row whose identity or fields are malformed
+    /// rejects the backup, whichever format it has.
+    nonisolated private func fetchKindScoped<Record: FetchableRecord & TableRecord>(
+        _: Record.Type,
+        component: BackupComponent,
+        rowCode: String,
+        identityColumns: [String],
+        resolveKind: (Row) -> MediaKind?,
+        capturedAt: Date,
+        archives: inout [LegacyStateArchiveRecord],
+        in db: Database
+    ) throws -> [Record] {
+        let table = Record.databaseTableName
+        guard try db.tableExists(table) else { return [] }
+        let storesKind = try hasColumns(["mediaKind"], in: table, db: db)
+        func rejected(_ code: String) -> BackupPreflightError {
+            .rejected(.invalidComponentData(component: component, code: code))
+        }
+        var records: [Record] = []
+        for row in try Row.fetchAll(db, sql: "SELECT * FROM \(table)") {
+            let kindedRow: Row
+            if storesKind {
+                guard let rawKind: String = LegacyMediaKindResolver.value(row, "mediaKind"),
+                      MediaKind(rawValue: rawKind) != nil else {
+                    throw rejected("invalidMediaKind")
+                }
+                kindedRow = row
+            } else {
+                guard identityColumns.allSatisfy({ (LegacyMediaKindResolver.value(row, $0) as String?) != nil }) else {
+                    throw rejected(rowCode)
+                }
+                guard let kind = resolveKind(row) else {
+                    archives.append(
+                        try LegacyMediaKindResolver.archiveRecord(table: table, row: row, capturedAt: capturedAt)
+                    )
+                    continue
+                }
+                var columns: [String: (any DatabaseValueConvertible)?] = [:]
+                for (column, value) in row {
+                    columns[column] = value
+                }
+                columns["mediaKind"] = kind.rawValue
+                kindedRow = Row(columns)
+            }
+            do {
+                records.append(try Record(row: kindedRow))
+            } catch {
+                throw rejected(rowCode)
+            }
+        }
+        return records
+    }
+
+    nonisolated private static func uniqueArchives(_ archives: [LegacyStateArchiveRecord]) -> [LegacyStateArchiveRecord] {
+        var seen = Set<[String]>()
+        return archives.filter {
+            seen.insert([$0.sourceDomain, $0.sourceKey, $0.contentClass.rawValue, $0.valueType, $0.fingerprint]).inserted
+        }
     }
 
     nonisolated private func synthesizeLegacyRepositories(
