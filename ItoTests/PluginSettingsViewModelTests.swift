@@ -22,7 +22,7 @@ final class PluginSettingsViewModelTests: XCTestCase {
         XCTAssertNil(viewModel.loadError)
     }
 
-    func testSchemaIsExposedWithoutParallelMutableRowModels() throws {
+    func testLegacySettingsAreProjectedIntoUnifiedPresentation() throws {
         let settings: [Setting] = [
             .toggle(id: "toggle", name: "Toggle", summary: nil, defaultValue: true),
             .text(id: "text", name: "Text", summary: "Summary", defaultValue: "value"),
@@ -36,8 +36,342 @@ final class PluginSettingsViewModelTests: XCTestCase {
         ]
         let viewModel = makeViewModel(schema: try pr7bSettingsSchema(settings: settings))
 
-        XCTAssertEqual(viewModel.schema.settings.count, 3)
+        XCTAssertEqual(viewModel.presentation.controls.count, 3)
         XCTAssertEqual(viewModel.plugin.id, "plugin.manga")
+    }
+
+    func testLegacyRawTextAndPickerValuesRemainReadableAndEditable() throws {
+        let text = String(repeating: "é", count: 2_049) + "\u{0001}\n"
+        let picker = String(repeating: "é", count: 129) + "\u{0001}"
+        let store = PR7BSettingsStoreSpy()
+        let viewModel = makeViewModel(schema: try pr7bSettingsSchema(settings: [
+            .text(id: "text", name: "Text", summary: nil, defaultValue: "default"),
+            .picker(id: "picker", name: "Picker", summary: nil, options: [picker], defaultValue: picker)
+        ]), store: store)
+        let controls = viewModel.presentation.controls
+        store.values["text"] = text
+        store.values["picker"] = picker
+
+        for (control, value) in zip(controls, [ControlValue.text(text), .select(picker)]) {
+            XCTAssertEqual(viewModel.effectiveValue(for: control), value)
+            XCTAssertEqual(viewModel.effectiveValueState(for: control).state, .valid)
+        }
+        XCTAssertTrue(viewModel.persistControlValue(.text(text + "edited"), for: controls[0]))
+        XCTAssertTrue(viewModel.persistControlValue(.select(picker + "edited"), for: controls[1]))
+        XCTAssertEqual(store.values["text"], text + "edited")
+        XCTAssertEqual(store.values["picker"], picker + "edited")
+        XCTAssertEqual(viewModel.effectiveValue(for: controls[0]), .text(text + "edited"))
+        XCTAssertEqual(viewModel.effectiveValue(for: controls[1]), .select(picker + "edited"))
+        XCTAssertFalse(viewModel.persistControlValue(.toggle(true), for: controls[0]))
+        XCTAssertFalse(viewModel.persistControlValue(.text("wrong kind"), for: controls[1]))
+        XCTAssertEqual(store.writes.count, 2)
+        viewModel.cancel()
+    }
+
+    func testLegacyEmptyPickerOptionRoundTripsWithANonemptyDefault() throws {
+        let store = PR7BSettingsStoreSpy()
+        let viewModel = makeViewModel(schema: try pr7bSettingsSchema(settings: [
+            .picker(id: "emptyDefault", name: "Empty default", summary: nil, options: ["", "other"], defaultValue: ""),
+            .picker(id: "choice", name: "Choice", summary: nil, options: ["", "other"], defaultValue: "other")
+        ]), store: store)
+        let emptyDefault = viewModel.presentation.controls[0]
+        let choice = viewModel.presentation.controls[1]
+        XCTAssertEqual(viewModel.effectiveValue(for: emptyDefault), .select(""))
+        XCTAssertEqual(viewModel.effectiveValue(for: choice), .select("other"))
+        XCTAssertEqual(viewModel.effectiveValueState(for: choice).state, .unset)
+        let read = { viewModel.effectiveValue(for: choice) ?? .select(nil) }
+        let write: (ControlValue) -> Void = { _ = viewModel.persistControlValue($0, for: choice) }
+        XCTAssertTrue(ControlSelectionEditing.toggle("", control: choice, currentValue: read, onChange: write))
+        XCTAssertEqual(store.values["choice"], "")
+        XCTAssertEqual(read(), .select(""))
+        XCTAssertEqual(read().selectedOptions, [""])
+        XCTAssertEqual(viewModel.effectiveValueState(for: choice).state, .valid)
+        XCTAssertTrue(viewModel.resetControl(choice))
+        XCTAssertNil(store.values["choice"])
+        XCTAssertEqual(read(), .select("other"))
+        viewModel.cancel()
+    }
+
+    func testLegacyToggleUsesDefaultOnlyWhenAbsentAndExactTrueOtherwise() throws {
+        let store = PR7BSettingsStoreSpy()
+        let viewModel = makeViewModel(schema: try pr7bSettingsSchema(settings: [
+            .toggle(id: "toggle", name: "Toggle", summary: nil, defaultValue: true)
+        ]), store: store)
+        let control = viewModel.presentation.controls[0]
+        XCTAssertEqual(viewModel.effectiveValue(for: control), .toggle(true))
+        XCTAssertEqual(viewModel.effectiveValueState(for: control).state, .unset)
+        for stored in ["false", "", "TRUE", "invalid"] {
+            store.values["toggle"] = stored
+            XCTAssertEqual(viewModel.effectiveValue(for: control), .toggle(false))
+            XCTAssertEqual(viewModel.effectiveValueState(for: control).state, .valid)
+        }
+        store.values["toggle"] = "true"
+        XCTAssertEqual(viewModel.effectiveValue(for: control), .toggle(true))
+        XCTAssertTrue(viewModel.persistControlValue(.toggle(false), for: control))
+        XCTAssertEqual(store.values["toggle"], "false")
+        XCTAssertFalse(viewModel.persistControlValue(.text("true"), for: control))
+        viewModel.cancel()
+    }
+
+    func testRichTextAndPickerStillRejectOversizedAndControlCharacterValues() {
+        let store = PR7BSettingsStoreSpy()
+        let text = richControl("text", .text(TextControl(defaultValue: "default", placeholder: nil, flags: [])))
+        let picker = richControl("picker", .select(SelectControl(options: .inline([]), defaultValue: nil)))
+        let viewModel = richViewModel([text, picker], store: store)
+        for invalid in [String(repeating: "é", count: 2_049), "control\u{0001}"] {
+            store.values["text"] = invalid
+            XCTAssertEqual(viewModel.effectiveValue(for: text), .text("default"))
+            XCTAssertEqual(viewModel.effectiveValueState(for: text).state, .invalid)
+            XCTAssertFalse(viewModel.persistControlValue(.text(invalid), for: text))
+            XCTAssertEqual(store.values["text"], invalid)
+        }
+        for invalid in [String(repeating: "é", count: 129), "control\u{0001}"] {
+            store.values["picker"] = invalid
+            XCTAssertEqual(viewModel.effectiveValue(for: picker), .select(nil))
+            XCTAssertEqual(viewModel.effectiveValueState(for: picker).state, .invalid)
+            XCTAssertFalse(viewModel.persistControlValue(.select(invalid), for: picker))
+            XCTAssertEqual(store.values["picker"], invalid)
+        }
+        XCTAssertTrue(store.writes.isEmpty)
+        viewModel.cancel()
+    }
+
+    func testExplicitRichSelectionClearKeepsMigratedKeyUntilReset() {
+        let store = PR7BSettingsStoreSpy()
+        store.values["discover_spotlight_genre"] = "Action"
+        let control = richControl("discover_spotlight_genre_id", .select(SelectControl(
+            options: .inline([ChoiceOption(value: "action", label: "Action")]), defaultValue: nil
+        )))
+        let viewModel = richViewModel([control], store: store)
+        XCTAssertTrue(viewModel.persistControlValue(.select("action"), for: control))
+        XCTAssertTrue(viewModel.persistControlValue(.select(nil), for: control))
+        XCTAssertEqual(store.values[control.id], "")
+        XCTAssertEqual(store.values["discover_spotlight_genre"], "Action")
+        XCTAssertEqual(viewModel.effectiveValue(for: control), .select(nil))
+        XCTAssertEqual(viewModel.effectiveValueState(for: control).state, .valid)
+        XCTAssertTrue(viewModel.resetControl(control))
+        XCTAssertNil(store.values[control.id])
+        XCTAssertEqual(store.values["discover_spotlight_genre"], "Action")
+        XCTAssertEqual(viewModel.effectiveValueState(for: control).state, .unset)
+        viewModel.cancel()
+    }
+    func testIntegerDraftCommitsOnlyValidBoundedValues() {
+        let kind = ControlKind.integer(IntegerControl(min: 1900, max: 2100, defaultValue: nil, unit: nil))
+        var draft = IntegerControlDraft(value: .integer(nil))
+        draft.edit(lower: "2101", kind: kind)
+        XCTAssertNil(draft.committedValue(kind: kind))
+        XCTAssertEqual(draft.lower, "2101")
+        XCTAssertNotNil(draft.error)
+        draft.edit(lower: " 2025 ", kind: kind)
+        XCTAssertEqual(draft.committedValue(kind: kind), .integer(2025))
+        XCTAssertNil(draft.error)
+        draft.edit(lower: "", kind: kind)
+        XCTAssertEqual(draft.committedValue(kind: kind), .integer(nil))
+    }
+
+    func testRapidMultiEditsReadStoreAndFailedWriteDoesNotBecomeNextInput() {
+        let store = PR7BSettingsStoreSpy()
+        let control = richControl("tags", .multiSelect(MultiSelectControl(
+            options: .inline([]), defaultValue: [], maxSelected: 2
+        )))
+        let viewModel = richViewModel([control], store: store)
+        let read = { viewModel.effectiveValue(for: control) ?? .multiSelect([]) }
+        let write: (ControlValue) -> Void = { _ = viewModel.persistControlValue($0, for: control) }
+        XCTAssertTrue(ControlSelectionEditing.toggle("a", control: control, currentValue: read, onChange: write))
+        XCTAssertTrue(ControlSelectionEditing.toggle("b", control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(read(), .multiSelect(["a", "b"]))
+        XCTAssertFalse(ControlSelectionEditing.toggle("c", control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(store.writes.count, 2)
+
+        store.persistSucceeds = false
+        XCTAssertTrue(ControlSelectionEditing.toggle("a", control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(read(), .multiSelect(["a", "b"]))
+        XCTAssertNotNil(viewModel.persistenceError)
+        store.persistSucceeds = true
+        XCTAssertTrue(ControlSelectionEditing.toggle("b", control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(read(), .multiSelect(["a"]))
+        viewModel.cancel()
+    }
+
+    func testByteDistinctMultiSelectionsRetainOrderLimitAndRollback() {
+        let composed = "\u{00E9}"
+        let decomposed = "e\u{0301}"
+        let store = PR7BSettingsStoreSpy()
+        let control = richControl("tags", .multiSelect(MultiSelectControl(
+            options: .inline([
+                ChoiceOption(value: composed, label: "Composed", group: nil),
+                ChoiceOption(value: decomposed, label: "Decomposed", group: nil),
+                ChoiceOption(value: "other", label: "Other", group: nil)
+            ]), defaultValue: [], maxSelected: 2
+        )))
+        let viewModel = richViewModel([control], store: store)
+        let read = { viewModel.effectiveValue(for: control) ?? .multiSelect([]) }
+        let write: (ControlValue) -> Void = { _ = viewModel.persistControlValue($0, for: control) }
+        let identities = { read().selectedOptions.map { Data($0.utf8) } }
+        XCTAssertTrue(ControlSelectionEditing.toggle(composed, control: control, currentValue: read, onChange: write))
+        XCTAssertTrue(ControlSelectionEditing.toggle(decomposed, control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(identities(), [Data(composed.utf8), Data(decomposed.utf8)])
+        XCTAssertFalse(ControlSelectionEditing.toggle("other", control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(store.writes.count, 2)
+
+        store.persistSucceeds = false
+        XCTAssertTrue(ControlSelectionEditing.toggle(decomposed, control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(identities(), [Data(composed.utf8), Data(decomposed.utf8)])
+        XCTAssertNotNil(viewModel.persistenceError)
+        store.persistSucceeds = true
+        XCTAssertTrue(ControlSelectionEditing.toggle(composed, control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(identities(), [Data(decomposed.utf8)])
+        XCTAssertTrue(ControlSelectionEditing.toggle(composed, control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(identities(), [Data(decomposed.utf8), Data(composed.utf8)])
+        XCTAssertTrue(ControlSelectionEditing.toggle(decomposed, control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(identities(), [Data(composed.utf8)])
+        viewModel.cancel()
+    }
+
+    func testByteDistinctSingleSelectionSwitchesToExactTappedValue() {
+        let composed = "\u{00E9}"
+        let decomposed = "e\u{0301}"
+        let store = PR7BSettingsStoreSpy()
+        let control = richControl("language", .select(SelectControl(
+            options: .inline([
+                ChoiceOption(value: composed, label: "Composed", group: nil),
+                ChoiceOption(value: decomposed, label: "Decomposed", group: nil)
+            ]), defaultValue: nil
+        )))
+        let viewModel = richViewModel([control], store: store)
+        let read = { viewModel.effectiveValue(for: control) ?? .select(nil) }
+        let write: (ControlValue) -> Void = { _ = viewModel.persistControlValue($0, for: control) }
+        XCTAssertTrue(ControlSelectionEditing.toggle(composed, control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(read().selectedOptions.map { Data($0.utf8) }, [Data(composed.utf8)])
+        XCTAssertTrue(ControlSelectionEditing.toggle(decomposed, control: control, currentValue: read, onChange: write))
+        XCTAssertEqual(read().selectedOptions.map { Data($0.utf8) }, [Data(decomposed.utf8)])
+        viewModel.cancel()
+    }
+
+    func testInvalidStoredValueIsRetainedUntilAnExplicitEditOrReset() {
+        let store = PR7BSettingsStoreSpy()
+        let control = richControl("year", .integer(IntegerControl(min: 0, max: 100, defaultValue: 10, unit: nil)))
+        store.values["year"] = "999"
+        let viewModel = richViewModel([control], store: store)
+        XCTAssertEqual(viewModel.effectiveValue(for: control), .integer(10))
+        XCTAssertEqual(control.effectiveValue(stored: store.values["year"]).state, .invalid)
+        XCTAssertEqual(store.values["year"], "999")
+        XCTAssertTrue(store.writes.isEmpty)
+        XCTAssertFalse(viewModel.persistControlValue(.integer(101), for: control))
+        XCTAssertEqual(store.values["year"], "999")
+        XCTAssertTrue(viewModel.resetControl(control))
+        XCTAssertNil(store.values["year"])
+        XCTAssertEqual(viewModel.effectiveValue(for: control), .integer(10))
+        viewModel.cancel()
+    }
+
+    func testSelectFailureKeepsStoredSelectionAndResetRemovesTheKey() {
+        let store = PR7BSettingsStoreSpy()
+        let control = richControl("language", .select(SelectControl(options: .inline([]), defaultValue: nil)))
+        let viewModel = richViewModel([control], store: store)
+        XCTAssertTrue(viewModel.persistControlValue(.select("old"), for: control))
+        store.persistSucceeds = false
+        XCTAssertFalse(viewModel.persistControlValue(.select("new"), for: control))
+        XCTAssertEqual(viewModel.effectiveValue(for: control), .select("old"))
+        XCTAssertFalse(viewModel.resetControl(control))
+        XCTAssertEqual(viewModel.effectiveValue(for: control), .select("old"))
+        store.persistSucceeds = true
+        XCTAssertTrue(viewModel.resetControl(control))
+        XCTAssertNil(store.values["language"])
+        XCTAssertEqual(viewModel.effectiveValue(for: control), .select(nil))
+        viewModel.cancel()
+    }
+
+    func testVisibilityUsesEffectiveValuesAndPreservesHiddenStoredValues() {
+        let store = PR7BSettingsStoreSpy()
+        let toggle = richControl("advanced", .toggle(ToggleControl(defaultValue: false)))
+        let dependent = Control(
+            id: "detail", title: "Detail", summary: nil, flags: 0,
+            visibleWhen: [ControlCondition(control: "advanced", anyOf: ["true"])],
+            kind: .text(TextControl(defaultValue: "", placeholder: nil, flags: []))
+        )
+        store.values["detail"] = "kept"
+        let viewModel = richViewModel([toggle, dependent], store: store)
+        XCTAssertEqual(viewModel.visibleSections.flatMap(\.controls).map(\.id), ["advanced"])
+        XCTAssertTrue(viewModel.persistControlValue(.toggle(true), for: toggle))
+        XCTAssertEqual(viewModel.visibleSections.flatMap(\.controls).map(\.id), ["advanced", "detail"])
+        XCTAssertTrue(viewModel.resetControl(toggle))
+        XCTAssertEqual(viewModel.visibleSections.flatMap(\.controls).map(\.id), ["advanced"])
+        XCTAssertEqual(store.values["detail"], "kept")
+        viewModel.cancel()
+    }
+
+    func testFutureControlDoesNotHideSupportedDependentSettings() {
+        let store = PR7BSettingsStoreSpy()
+        let future = richControl("future", .unsupported(tag: 99))
+        let dependent = Control(
+            id: "detail", title: "Detail", visibleWhen: [
+                ControlCondition(control: "future", anyOf: ["enabled"])
+            ], kind: .toggle(ToggleControl(defaultValue: false))
+        )
+        let viewModel = richViewModel([future, dependent], store: store)
+        XCTAssertEqual(viewModel.visibleSections.flatMap(\.controls).map(\.id), ["future", "detail"])
+        viewModel.cancel()
+    }
+
+    func testVisibilityDistinguishesByteDistinctOptionValues() {
+        let store = PR7BSettingsStoreSpy()
+        let composed = "\u{00e9}"
+        let decomposed = "e\u{0301}"
+        let target = richControl("choice", .select(SelectControl(
+            options: .inline([
+                ChoiceOption(value: composed, label: "First"),
+                ChoiceOption(value: decomposed, label: "Second")
+            ]), defaultValue: composed
+        )))
+        let dependent = Control(
+            id: "detail", title: "Detail", visibleWhen: [
+                ControlCondition(control: "choice", anyOf: [decomposed])
+            ], kind: .toggle(ToggleControl(defaultValue: false))
+        )
+        let viewModel = richViewModel([target, dependent], store: store)
+        XCTAssertEqual(viewModel.visibleSections.flatMap(\.controls).map(\.id), ["choice"])
+        XCTAssertTrue(viewModel.persistControlValue(.select(decomposed), for: target))
+        XCTAssertEqual(viewModel.visibleSections.flatMap(\.controls).map(\.id), ["choice", "detail"])
+        viewModel.cancel()
+    }
+
+    func testIntegerRangesRejectInvalidDraftsWithoutChangingTheirText() {
+        let kind = ControlKind.integerRange(IntegerRangeControl(
+            min: -10, max: 100, defaultLower: nil, defaultUpper: nil, unit: nil
+        ))
+        var draft = IntegerControlDraft(value: .integerRange(lower: 1, upper: 10))
+        for invalid in ["1.5", "101", "-11", "9223372036854775808", "text"] {
+            draft.edit(lower: invalid, kind: kind)
+            XCTAssertNil(draft.committedValue(kind: kind))
+            XCTAssertEqual(draft.lower, invalid)
+            XCTAssertNotNil(draft.error)
+        }
+        draft.edit(lower: "20", upper: "10", kind: kind)
+        XCTAssertNil(draft.committedValue(kind: kind))
+        XCTAssertEqual(draft.lower, "20")
+        XCTAssertEqual(draft.upper, "10")
+        draft.edit(lower: " -10 ", upper: "100", kind: kind)
+        XCTAssertEqual(draft.committedValue(kind: kind), .integerRange(lower: -10, upper: 100))
+        draft.edit(lower: "", upper: "100", kind: kind)
+        XCTAssertEqual(draft.committedValue(kind: kind), .integerRange(lower: nil, upper: 100))
+        draft.edit(lower: "", upper: "", kind: kind)
+        XCTAssertEqual(draft.committedValue(kind: kind), .integerRange(lower: nil, upper: nil))
+        XCTAssertNil(draft.error)
+    }
+
+    private func richControl(_ id: String, _ kind: ControlKind) -> Control {
+        Control(id: id, title: id, summary: nil, flags: 0, visibleWhen: [], kind: kind)
+    }
+
+    private func richViewModel(_ controls: [Control], store: PR7BSettingsStoreSpy) -> PluginSettingsViewModel {
+        PluginSettingsViewModel(
+            plugin: pr7bPlugin(),
+            surface: .form(SettingsForm(sections: [
+                ControlSection(id: "rich", title: "Rich", summary: nil, flags: [], controls: controls)
+            ])),
+            settingsStore: store, messagePresenter: PR7BMessagePresenterSpy()
+        )
     }
 
     func testBindingReadsAuthoritativeStoreAndTracksRevisionPublication() throws {
@@ -530,7 +864,7 @@ final class PluginSettingsViewModelTests: XCTestCase {
     ) -> PluginSettingsViewModel {
         PluginSettingsViewModel(
             plugin: pr7bPlugin(),
-            schema: schema,
+            surface: .legacy(schema, formFailure: nil),
             settingsStore: store,
             messagePresenter: messages,
             completionRecovery: recovery,
